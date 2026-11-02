@@ -25,6 +25,10 @@ const AD_COMPLETE_128BIT_UUIDS: u8 = 0x07;
 const AD_SHORTENED_LOCAL_NAME: u8 = 0x08;
 const AD_COMPLETE_LOCAL_NAME: u8 = 0x09;
 const AD_TX_POWER_LEVEL: u8 = 0x0A;
+const AD_SERVICE_DATA_16BIT: u8 = 0x16;
+const AD_APPEARANCE: u8 = 0x19;
+const AD_SERVICE_DATA_32BIT: u8 = 0x20;
+const AD_SERVICE_DATA_128BIT: u8 = 0x21;
 const AD_MANUFACTURER_DATA: u8 = 0xFF;
 
 /// Decoded fields from one advertisement's AD payload.
@@ -36,6 +40,11 @@ pub struct ParsedAd {
     pub service_uuids: Vec<String>,
     /// Manufacturer-specific data keyed by company identifier (AD type 0xFF).
     pub manufacturer_data: HashMap<u16, Vec<u8>>,
+    /// Service data (AD types 0x16 / 0x20 / 0x21), keyed by the service UUID
+    /// normalized to lowercase 128-bit string form.
+    pub service_data: HashMap<String, Vec<u8>>,
+    /// Appearance (AD type 0x19), the GAP appearance category value.
+    pub appearance: Option<u16>,
     /// TX power level in dBm (AD type 0x0A), if present.
     pub tx_power: Option<i8>,
 }
@@ -75,6 +84,20 @@ impl ParsedAd {
             if replace {
                 self.manufacturer_data.insert(company, data);
             }
+        }
+        for (uuid, data) in rsp.service_data {
+            // Same rule as manufacturer data: the longer payload survives a
+            // conflict, so a response that enriches the primary's entry wins.
+            let replace = match self.service_data.get(&uuid) {
+                Some(existing) => data.len() > existing.len(),
+                None => true,
+            };
+            if replace {
+                self.service_data.insert(uuid, data);
+            }
+        }
+        if self.appearance.is_none() {
+            self.appearance = rsp.appearance;
         }
         if self.tx_power.is_none() {
             self.tx_power = rsp.tx_power;
@@ -279,6 +302,32 @@ pub fn parse_ad_structures(data: &[u8]) -> ParsedAd {
                 if value.len() >= 2 {
                     let company = u16::from_le_bytes([value[0], value[1]]);
                     out.manufacturer_data.insert(company, value[2..].to_vec());
+                }
+            }
+            AD_SERVICE_DATA_16BIT => {
+                if value.len() >= 2 {
+                    let uuid = format_uuid16(u16::from_le_bytes([value[0], value[1]]));
+                    out.service_data.insert(uuid, value[2..].to_vec());
+                }
+            }
+            AD_SERVICE_DATA_32BIT => {
+                if value.len() >= 4 {
+                    let v = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    out.service_data
+                        .insert(format_uuid32(v), value[4..].to_vec());
+                }
+            }
+            AD_SERVICE_DATA_128BIT => {
+                if value.len() >= 16 {
+                    let mut uuid_le = [0u8; 16];
+                    uuid_le.copy_from_slice(&value[..16]);
+                    out.service_data
+                        .insert(format_uuid128(&uuid_le), value[16..].to_vec());
+                }
+            }
+            AD_APPEARANCE => {
+                if value.len() >= 2 {
+                    out.appearance = Some(u16::from_le_bytes([value[0], value[1]]));
                 }
             }
             AD_TX_POWER_LEVEL => {
@@ -623,6 +672,77 @@ mod tests {
     }
 
     #[test]
+    fn ad_parses_service_data() {
+        // 16-bit: uuid 0x180f (LE bytes 0f 18), payload 0x64.
+        let data = [0x04, AD_SERVICE_DATA_16BIT, 0x0f, 0x18, 0x64];
+        let ad = parse_ad_structures(&data);
+        assert_eq!(
+            ad.service_data.get("0000180f-0000-1000-8000-00805f9b34fb"),
+            Some(&vec![0x64])
+        );
+
+        // 32-bit: uuid 0x12345678, payload aa bb.
+        let data = [
+            0x07,
+            AD_SERVICE_DATA_32BIT,
+            0x78,
+            0x56,
+            0x34,
+            0x12,
+            0xaa,
+            0xbb,
+        ];
+        let ad = parse_ad_structures(&data);
+        assert_eq!(
+            ad.service_data.get("12345678-0000-1000-8000-00805f9b34fb"),
+            Some(&vec![0xaa, 0xbb])
+        );
+
+        // 128-bit: the LE bytes of 00003100-0000-1000-8000-00805f9b34fb, payload 01.
+        let mut data = vec![0x12, AD_SERVICE_DATA_128BIT];
+        data.extend_from_slice(&[
+            0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x00, 0x31,
+            0x00, 0x00,
+        ]);
+        data.push(0x01);
+        let ad = parse_ad_structures(&data);
+        assert_eq!(
+            ad.service_data.get("00003100-0000-1000-8000-00805f9b34fb"),
+            Some(&vec![0x01])
+        );
+    }
+
+    #[test]
+    fn ad_parses_service_data_with_empty_payload() {
+        // A bare UUID with no payload is still an entry: the device advertises
+        // the service, just with nothing attached.
+        let data = [0x03, AD_SERVICE_DATA_16BIT, 0x0f, 0x18];
+        let ad = parse_ad_structures(&data);
+        assert_eq!(
+            ad.service_data.get("0000180f-0000-1000-8000-00805f9b34fb"),
+            Some(&vec![])
+        );
+    }
+
+    #[test]
+    fn ad_parses_appearance() {
+        // 0x0341 = Generic Watch.
+        let data = [0x03, AD_APPEARANCE, 0x41, 0x03];
+        let ad = parse_ad_structures(&data);
+        assert_eq!(ad.appearance, Some(0x0341));
+    }
+
+    #[test]
+    fn ad_ignores_truncated_service_data_and_appearance() {
+        // 16-bit service data needs at least its 2 UUID bytes and appearance
+        // needs both of its bytes; shorter values are skipped without panicking.
+        let data = [0x02, AD_SERVICE_DATA_16BIT, 0x0f, 0x02, AD_APPEARANCE, 0x41];
+        let ad = parse_ad_structures(&data);
+        assert!(ad.service_data.is_empty());
+        assert_eq!(ad.appearance, None);
+    }
+
+    #[test]
     fn ad_parses_tx_power() {
         let data = [0x02, AD_TX_POWER_LEVEL, 0xf8]; // -8 dBm
         let ad = parse_ad_structures(&data);
@@ -715,6 +835,8 @@ mod tests {
             local_name: Some("Bcn".to_string()), // shortened
             service_uuids: vec!["a".to_string()],
             manufacturer_data: HashMap::from([(0x09C8, vec![1, 2])]),
+            service_data: HashMap::from([("sd-a".to_string(), vec![1, 2])]),
+            appearance: None,
             tx_power: None,
         };
         let rsp = ParsedAd {
@@ -724,6 +846,11 @@ mod tests {
                 (0x09C8, vec![9, 9]), // primary wins on conflict
                 (0x00E0, vec![3]),    // new company added
             ]),
+            service_data: HashMap::from([
+                ("sd-a".to_string(), vec![9, 9]), // same length: primary wins
+                ("sd-b".to_string(), vec![3]),    // new service added
+            ]),
+            appearance: Some(0x0341),
             tx_power: Some(-4),
         };
         primary.merge_scan_response(rsp);
@@ -734,7 +861,25 @@ mod tests {
         );
         assert_eq!(primary.manufacturer_data.get(&0x09C8), Some(&vec![1, 2]));
         assert_eq!(primary.manufacturer_data.get(&0x00E0), Some(&vec![3]));
+        assert_eq!(primary.service_data.get("sd-a"), Some(&vec![1, 2]));
+        assert_eq!(primary.service_data.get("sd-b"), Some(&vec![3]));
+        assert_eq!(primary.appearance, Some(0x0341));
         assert_eq!(primary.tx_power, Some(-4));
+    }
+
+    #[test]
+    fn merge_scan_response_keeps_longer_service_data_payload() {
+        // A bare entry in the primary, the same service carrying its payload in
+        // the response. The richer copy must survive the merge.
+        let mut primary = ParsedAd {
+            service_data: HashMap::from([("sd".to_string(), vec![])]),
+            ..ParsedAd::default()
+        };
+        primary.merge_scan_response(ParsedAd {
+            service_data: HashMap::from([("sd".to_string(), vec![0x64, 0x01])]),
+            ..ParsedAd::default()
+        });
+        assert_eq!(primary.service_data.get("sd"), Some(&vec![0x64, 0x01]));
     }
 
     #[test]

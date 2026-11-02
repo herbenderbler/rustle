@@ -158,8 +158,7 @@ mod tests {
             ad: ParsedAd {
                 local_name: name.map(str::to_string),
                 service_uuids: uuids.iter().map(|s| s.to_string()).collect(),
-                manufacturer_data: Default::default(),
-                tx_power: None,
+                ..ParsedAd::default()
             },
         }
     }
