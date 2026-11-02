@@ -28,7 +28,7 @@ library.
 | `adapter` | `hci_dev_info` decoding, adapter selection | `enumerate()`: `HCIGETDEVLIST` / `HCIGETDEVINFO` |
 | `att` | ATT PDU encoder / decoder | — |
 | `gatt` | GATT declarations, characteristic properties, CCCD values | — |
-| `client` | `GattClient`, generic over an `AttIo` transport (MTU exchange, discovery, read / read-long / write, notifications) | — |
+| `client` | `GattClient`, generic over an `AttIo` transport (MTU exchange, discovery, read / read-long / write with and without response, notifications) | — |
 | `l2cap` | address helpers, `SecurityLevel` | `L2capAtt`: a connected L2CAP ATT channel implementing `AttIo` |
 
 Every module keeps its pure layer separate from its socket layer, so the

@@ -361,6 +361,23 @@ impl<T: AttIo> GattClient<T> {
         }
     }
 
+    /// Write a value with a Write Command (unacknowledged). Success means the
+    /// PDU was handed to the transport, not that the server applied it. The
+    /// value must fit in one PDU (the MTU minus the 3-byte header): the server
+    /// silently drops an oversized Write Command, so it is rejected here where
+    /// the caller can see the failure.
+    pub fn write_without_response(&mut self, handle: u16, value: &[u8]) -> Result<(), GattError> {
+        let max = self.mtu as usize - 3;
+        if value.len() > max {
+            return Err(GattError::Protocol(format!(
+                "Write Command value is {} bytes but the MTU allows {max}",
+                value.len()
+            )));
+        }
+        self.io.send(&att::write_cmd(handle, value))?;
+        Ok(())
+    }
+
     /// Subscribe (or, with both `false`, unsubscribe) by writing the CCCD.
     pub fn subscribe(
         &mut self,
@@ -642,6 +659,30 @@ mod tests {
         // Server offers 100, we asked for 64 -> min is 64.
         let mut client = GattClient::new(MockIo::new(vec![vec![0x03, 0x64, 0x00]]));
         assert_eq!(client.exchange_mtu(0x0040).unwrap(), 64);
+    }
+
+    #[test]
+    fn write_without_response_sends_a_write_command() {
+        // No response is expected, so the empty response queue is never read.
+        let mut client = GattClient::new(MockIo::new(vec![]));
+        client
+            .write_without_response(0x0004, &[0x01, 0x00])
+            .unwrap();
+        assert_eq!(client.io.sent, vec![vec![0x52, 0x04, 0x00, 0x01, 0x00]]);
+    }
+
+    #[test]
+    fn write_without_response_rejects_a_value_over_the_mtu() {
+        // The default MTU of 23 caps the value at 20 bytes. 21 bytes must fail
+        // client-side with nothing sent; exactly 20 must go through.
+        let mut client = GattClient::new(MockIo::new(vec![]));
+        let err = client
+            .write_without_response(0x0004, &[0u8; 21])
+            .unwrap_err();
+        assert!(matches!(err, GattError::Protocol(_)));
+        assert!(client.io.sent.is_empty());
+        client.write_without_response(0x0004, &[0u8; 20]).unwrap();
+        assert_eq!(client.io.sent.len(), 1);
     }
 
     #[test]
