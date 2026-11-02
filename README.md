@@ -25,6 +25,7 @@ library.
 | `hci` | HCI event framing, LE Advertising Report (legacy + extended) and AD-structure decoding, HCI command framing | — |
 | `scan` | scan parameters and their wire encodings | `HciScanner`: a raw HCI socket programmed for passive or active LE scanning, extended-scan with legacy fallback |
 | `scan_merge` | pairs a scannable advertisement with its `SCAN_RSP` | — |
+| `scan_filter` | `ScanFilter`: client-side matching of decoded advertisements against service UUIDs, a name prefix and manufacturer IDs | — |
 | `adapter` | `hci_dev_info` decoding, adapter selection | `enumerate()`: `HCIGETDEVLIST` / `HCIGETDEVINFO` |
 | `att` | ATT PDU encoder / decoder | — |
 | `gatt` | GATT declarations, characteristic properties, CCCD values | — |
