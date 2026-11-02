@@ -48,11 +48,13 @@ mod linux_impl {
     use super::{mac_str_to_le, SecurityLevel};
     use crate::client::AttIo;
     use crate::sys::{
-        bind, close, connect, errno, read, set_recv_timeout, setsockopt, socket, write, FdGuard,
-        Timeval, AF_BLUETOOTH, BTPROTO_L2CAP, EAGAIN, EINTR, SOCK_SEQPACKET,
+        bind, close, connect, errno, fcntl, getsockopt, poll, read, set_recv_timeout, setsockopt,
+        socket, write, FdGuard, PollFd, Timeval, AF_BLUETOOTH, BTPROTO_L2CAP, EAGAIN, EINPROGRESS,
+        EINTR, F_GETFL, F_SETFL, O_NONBLOCK, POLLOUT, SOCK_SEQPACKET, SOL_SOCKET, SO_ERROR,
     };
     use std::io;
     use std::os::raw::{c_int, c_void};
+    use std::time::{Duration, Instant};
 
     const SOL_BLUETOOTH: c_int = 274;
     const BT_SECURITY: c_int = 4;
@@ -110,20 +112,17 @@ mod linux_impl {
     }
 
     impl L2capAtt {
-        /// Open an ATT channel to `peer` (a display MAC), sourced from adapter
-        /// address `local` (`None` binds `BDADDR_ANY` / the default adapter).
-        /// `*_random` selects random vs public addressing for each side.
-        /// `recv_timeout_secs` sets `SO_RCVTIMEO` so a notify read loop can poll a
-        /// shutdown flag. The `connect` itself is blocking (the kernel drives the
-        /// LE connection); a non-blocking connect timeout is a later refinement.
-        pub fn connect(
+        /// Create, bind and configure the ATT socket, stopping just short of
+        /// the connect. Returns the guarded fd (closed on early return until
+        /// ownership moves) and the peer sockaddr to connect to.
+        fn prepare(
             local: Option<&str>,
             local_random: bool,
             peer: &str,
             peer_random: bool,
             security: SecurityLevel,
             recv_timeout_secs: i64,
-        ) -> io::Result<Self> {
+        ) -> io::Result<(FdGuard, SockaddrL2)> {
             let peer_addr = mac_str_to_le(peer).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -175,8 +174,35 @@ mod linux_impl {
             // Receive timeout so a notify read loop stays responsive to shutdown.
             set_recv_timeout(fd, &Timeval::from_secs(recv_timeout_secs));
 
+            Ok((guard, sockaddr(peer_addr, peer_random)))
+        }
+
+        /// Open an ATT channel to `peer` (a display MAC), sourced from adapter
+        /// address `local` (`None` binds `BDADDR_ANY` / the default adapter).
+        /// `*_random` selects random vs public addressing for each side.
+        /// `recv_timeout_secs` sets `SO_RCVTIMEO` so a notify read loop can poll a
+        /// shutdown flag. The `connect` itself is blocking (the kernel drives the
+        /// LE connection) and runs until the kernel's own connection supervision
+        /// gives up; [`connect_timeout`](Self::connect_timeout) bounds it instead.
+        pub fn connect(
+            local: Option<&str>,
+            local_random: bool,
+            peer: &str,
+            peer_random: bool,
+            security: SecurityLevel,
+            recv_timeout_secs: i64,
+        ) -> io::Result<Self> {
+            let (guard, pa) = Self::prepare(
+                local,
+                local_random,
+                peer,
+                peer_random,
+                security,
+                recv_timeout_secs,
+            )?;
+
             // Connect — the kernel performs the LE connection + L2CAP channel setup.
-            let pa = sockaddr(peer_addr, peer_random);
+            let fd = guard.0;
             let rc = unsafe {
                 connect(
                     fd,
@@ -185,6 +211,111 @@ mod linux_impl {
                 )
             };
             if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            std::mem::forget(guard); // success — ownership moves to L2capAtt
+            Ok(L2capAtt { fd })
+        }
+
+        /// [`connect`](Self::connect) with a deadline on the connection
+        /// attempt. The connect is issued in non-blocking mode and awaited
+        /// with `poll`, so a peer that is absent or out of range fails with
+        /// [`io::ErrorKind::TimedOut`] after `timeout` instead of holding the
+        /// caller until the kernel gives up. A zero timeout fails unless the
+        /// connect completes immediately. On success the socket returns to
+        /// blocking mode, with receives paced by `recv_timeout_secs` exactly
+        /// as in [`connect`](Self::connect).
+        pub fn connect_timeout(
+            local: Option<&str>,
+            local_random: bool,
+            peer: &str,
+            peer_random: bool,
+            security: SecurityLevel,
+            recv_timeout_secs: i64,
+            timeout: Duration,
+        ) -> io::Result<Self> {
+            let (guard, pa) = Self::prepare(
+                local,
+                local_random,
+                peer,
+                peer_random,
+                security,
+                recv_timeout_secs,
+            )?;
+            let fd = guard.0;
+
+            // Non-blocking, so connect() returns at once with EINPROGRESS.
+            let flags = unsafe { fcntl(fd, F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let rc = unsafe {
+                connect(
+                    fd,
+                    &pa as *const SockaddrL2 as *const c_void,
+                    std::mem::size_of::<SockaddrL2>() as u32,
+                )
+            };
+            if rc < 0 {
+                let e = unsafe { errno() };
+                if e != EINPROGRESS {
+                    return Err(io::Error::from_raw_os_error(e));
+                }
+
+                // Await writability (the connect's completion) within the
+                // deadline, re-polling with the remaining time on EINTR.
+                let begun = Instant::now();
+                loop {
+                    let remaining = timeout.saturating_sub(begun.elapsed());
+                    let ms = remaining.as_millis().min(c_int::MAX as u128) as c_int;
+                    let mut pfd = PollFd {
+                        fd,
+                        events: POLLOUT,
+                        revents: 0,
+                    };
+                    let rc = unsafe { poll(&mut pfd, 1, ms) };
+                    if rc > 0 {
+                        break;
+                    }
+                    if rc == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("connect to {peer} timed out"),
+                        ));
+                    }
+                    let e = unsafe { errno() };
+                    if e != EINTR {
+                        return Err(io::Error::from_raw_os_error(e));
+                    }
+                }
+
+                // The socket is writable; SO_ERROR holds the connect's result.
+                let mut err: c_int = 0;
+                let mut len = std::mem::size_of::<c_int>() as u32;
+                let rc = unsafe {
+                    getsockopt(
+                        fd,
+                        SOL_SOCKET,
+                        SO_ERROR,
+                        &mut err as *mut c_int as *mut c_void,
+                        &mut len,
+                    )
+                };
+                if rc < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if err != 0 {
+                    return Err(io::Error::from_raw_os_error(err));
+                }
+            }
+
+            // Back to blocking; reads are paced by SO_RCVTIMEO as in connect().
+            if unsafe { fcntl(fd, F_SETFL, flags) } < 0 {
                 return Err(io::Error::last_os_error());
             }
 
@@ -247,6 +378,7 @@ mod other_impl {
     use crate::client::AttIo;
     use std::convert::Infallible;
     use std::io;
+    use std::time::Duration;
 
     /// An L2CAP ATT channel. This platform has no L2CAP socket, so
     /// [`L2capAtt::connect`] always fails with [`io::ErrorKind::Unsupported`]
@@ -262,6 +394,22 @@ mod other_impl {
             _peer_random: bool,
             _security: SecurityLevel,
             _recv_timeout_secs: i64,
+        ) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "L2CAP ATT sockets are only supported on Linux",
+            ))
+        }
+
+        /// Always [`io::ErrorKind::Unsupported`] on this platform.
+        pub fn connect_timeout(
+            _local: Option<&str>,
+            _local_random: bool,
+            _peer: &str,
+            _peer_random: bool,
+            _security: SecurityLevel,
+            _recv_timeout_secs: i64,
+            _timeout: Duration,
         ) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -325,6 +473,19 @@ mod tests {
             false,
             SecurityLevel::Low,
             1,
+        )
+        .err()
+        .expect("no L2CAP socket on this platform");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+
+        let err = L2capAtt::connect_timeout(
+            None,
+            false,
+            "AA:BB:CC:DD:EE:FF",
+            false,
+            SecurityLevel::Low,
+            1,
+            std::time::Duration::from_secs(5),
         )
         .err()
         .expect("no L2CAP socket on this platform");

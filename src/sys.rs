@@ -16,8 +16,27 @@ pub(crate) const BTPROTO_L2CAP: c_int = 0;
 pub(crate) const BTPROTO_HCI: c_int = 1;
 pub(crate) const SOL_SOCKET: c_int = 1;
 pub(crate) const SO_RCVTIMEO: c_int = 20;
+pub(crate) const SO_ERROR: c_int = 4;
 pub(crate) const EAGAIN: i32 = 11;
 pub(crate) const EINTR: i32 = 4;
+pub(crate) const EINPROGRESS: i32 = 115;
+
+// `fcntl` file-status flags. Like the socket constants above, these are the
+// asm-generic values shared by x86 / arm / arm64 / riscv.
+pub(crate) const F_GETFL: c_int = 3;
+pub(crate) const F_SETFL: c_int = 4;
+pub(crate) const O_NONBLOCK: c_int = 0o4000;
+
+/// `poll` "writable" event bit (`events` / `revents` are `short`).
+pub(crate) const POLLOUT: i16 = 0x0004;
+
+/// `struct pollfd` for `poll`.
+#[repr(C)]
+pub(crate) struct PollFd {
+    pub fd: c_int,
+    pub events: i16,
+    pub revents: i16,
+}
 
 /// `struct timeval` for `SO_RCVTIMEO`: two `c_long`s (`time_t` / `suseconds_t`
 /// are `long` for the legacy socket option). Using `c_long` keeps the layout
@@ -56,7 +75,16 @@ extern "C" {
         optval: *const c_void,
         optlen: u32,
     ) -> c_int;
+    pub(crate) fn getsockopt(
+        fd: c_int,
+        level: c_int,
+        optname: c_int,
+        optval: *mut c_void,
+        optlen: *mut u32,
+    ) -> c_int;
     pub(crate) fn ioctl(fd: c_int, request: c_ulong, arg: *mut c_void) -> c_int;
+    pub(crate) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    pub(crate) fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
     pub(crate) fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     pub(crate) fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     pub(crate) fn close(fd: c_int) -> c_int;
