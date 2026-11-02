@@ -1,0 +1,23 @@
+[package]
+name = "rustle"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Dependency-free Bluetooth Low Energy stack for Linux hosts: raw-HCI scanning, advertisement parsing, and an ATT/GATT client over L2CAP."
+readme = "README.md"
+repository = "https://github.com/herbenderbler/rustle"
+# Not published to crates.io (the `rustle` name is taken there); consumers
+# depend on this repository directly. Flipping this is a deliberate, separate
+# decision.
+publish = false
+# Verified by the `msrv` CI job.
+rust-version = "1.88"
+# The nightly-only fuzz crate (its own workspace) and the CI config never belong
+# in a package.
+exclude = ["/fuzz", "/.github"]
+
+# Intentionally dependency-free: the kernel's BlueZ sockets are driven through a
+# handful of `extern "C"` libc calls, and everything above them is plain `std`.
+# The pure layer uses only `std::collections`/`alloc` types, so a later `no_std`
+# pass (HashMap -> BTreeMap) is cheap if an embedded consumer ever needs it.
+[dependencies]

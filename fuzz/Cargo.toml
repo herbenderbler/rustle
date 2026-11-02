@@ -1,0 +1,40 @@
+# Coverage-guided fuzzing of the rustle byte parsers (see README.md).
+#
+# Detached from the parent workspace (own empty `[workspace]`), so the stable
+# build, CI, cargo-deny, and cargo-machete never see this nightly-only crate —
+# mirrors how firmware/flock-node stays out of the workspace.
+[package]
+name = "rustle-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rustle = { path = ".." }
+
+[[bin]]
+name = "hci_packet"
+path = "fuzz_targets/hci_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ad_structures"
+path = "fuzz_targets/ad_structures.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "att_pdu"
+path = "fuzz_targets/att_pdu.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
