@@ -16,7 +16,7 @@ rustle began life as the in-house BLE stack of
 [fflock](https://github.com/herbenderbler/fflock), where it replaced the
 `btleplug` + `tokio` + `libdbus` dependency tree with a receive-only scanner
 that could be audited end to end. It is now maintained here as a standalone
-library; fflock consumes it as a dependency.
+library.
 
 ## What's in the box
 
