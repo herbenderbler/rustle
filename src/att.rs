@@ -43,6 +43,8 @@ pub const OP_WRITE_RSP: u8 = 0x13;
 pub const OP_HANDLE_VALUE_NTF: u8 = 0x1B;
 pub const OP_HANDLE_VALUE_IND: u8 = 0x1D;
 pub const OP_HANDLE_VALUE_CFM: u8 = 0x1E;
+/// Write Command (unacknowledged; the command bit 0x40 set on Write Request).
+pub const OP_WRITE_CMD: u8 = 0x52;
 
 // ---------------------------------------------------------------------------
 // ATT error codes carried in an Error Response (Vol 3, Part F, §3.4.1.1). Only
@@ -149,6 +151,17 @@ pub fn write_req(handle: u16, value: &[u8]) -> Vec<u8> {
     let h = handle.to_le_bytes();
     let mut pkt = Vec::with_capacity(3 + value.len());
     pkt.extend_from_slice(&[OP_WRITE_REQ, h[0], h[1]]);
+    pkt.extend_from_slice(value);
+    pkt
+}
+
+/// Write Command (unacknowledged): write `value` to `handle`. The server sends
+/// neither a response nor an error, so the PDU layout is the only feedback the
+/// wire gives.
+pub fn write_cmd(handle: u16, value: &[u8]) -> Vec<u8> {
+    let h = handle.to_le_bytes();
+    let mut pkt = Vec::with_capacity(3 + value.len());
+    pkt.extend_from_slice(&[OP_WRITE_CMD, h[0], h[1]]);
     pkt.extend_from_slice(value);
     pkt
 }
@@ -360,6 +373,7 @@ mod tests {
             vec![0x0C, 0x25, 0x00, 0x16, 0x00]
         );
         assert_eq!(write_req(0x0025, &[0xAB]), vec![0x12, 0x25, 0x00, 0xAB]);
+        assert_eq!(write_cmd(0x0025, &[0xAB]), vec![0x52, 0x25, 0x00, 0xAB]);
         assert_eq!(handle_value_confirmation(), vec![0x1E]);
     }
 
