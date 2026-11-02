@@ -26,6 +26,7 @@
 //! | [`gatt`] | GATT declarations, properties, CCCD values | — |
 //! | [`client`] | [`client::GattClient`], generic over an [`client::AttIo`] transport | — |
 //! | [`l2cap`] | address helpers, [`l2cap::SecurityLevel`] | [`l2cap::L2capAtt`]: a connected L2CAP ATT channel |
+//! | [`conn`] | Read RSSI and connection-info codecs | [`conn::read_rssi`]: RSSI of an established LE connection |
 //!
 //! # Scanning
 //!
@@ -86,6 +87,7 @@
 pub mod adapter;
 pub mod att;
 pub mod client;
+pub mod conn;
 pub mod gatt;
 pub mod hci;
 pub mod l2cap;
