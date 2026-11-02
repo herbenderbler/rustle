@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="rustle logo" width="360">
+</p>
+
 # rustle
 
 A dependency-free Bluetooth Low Energy stack for Linux hosts: raw-HCI
