@@ -20,6 +20,7 @@
 //! | [`hci`] | HCI event framing, LE Advertising Report (legacy + extended) and AD-structure decoding, HCI command framing | — |
 //! | [`scan`] | scan parameters and their wire encodings | [`scan::HciScanner`]: a raw HCI socket programmed for passive or active LE scanning |
 //! | [`scan_merge`] | pairs a scannable advertisement with its `SCAN_RSP` | — |
+//! | [`scan_filter`] | [`scan_filter::ScanFilter`]: client-side matching of decoded advertisements | — |
 //! | [`adapter`] | `hci_dev_info` decoding, adapter selection | [`adapter::enumerate`]: `HCIGETDEVLIST` / `HCIGETDEVINFO` |
 //! | [`att`] | ATT PDU encoder / decoder | — |
 //! | [`gatt`] | GATT declarations, properties, CCCD values | — |
@@ -89,6 +90,7 @@ pub mod gatt;
 pub mod hci;
 pub mod l2cap;
 pub mod scan;
+pub mod scan_filter;
 pub mod scan_merge;
 
 #[cfg(target_os = "linux")]
