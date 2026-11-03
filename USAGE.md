@@ -167,6 +167,29 @@ UUIDs, manufacturer data, service data, appearance and TX power.
 Dropping the scanner stops the scan and closes the socket. Call `stop` to
 end the scan and keep the socket open for another `start`.
 
+### Long range scanning
+
+The extended commands can listen on the LE Coded PHY, which long range
+advertisers use. `ScanParams::phys` selects LE 1M (the default), Coded, or
+both. Legacy scanning is LE 1M only, so a Coded-only request fails on a
+controller without extended scanning instead of listening on the wrong
+PHY.
+
+```rust,no_run
+use rustle::scan::{HciScanner, ScanParams, ScanPhys};
+use std::time::Duration;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut scanner = HciScanner::open(0, Duration::from_secs(1))?;
+    let params = ScanParams {
+        phys: ScanPhys::M1AndCoded,
+        ..ScanParams::default()
+    };
+    scanner.start(params)?;
+    Ok(())
+}
+```
+
 ## Active scans and scan responses
 
 An active scan answers scannable advertisements with a scan request, so
