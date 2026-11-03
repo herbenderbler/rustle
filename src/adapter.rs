@@ -7,8 +7,8 @@
 //! - [`parse_dev_info`] (the `hci_dev_info` byte decoder), [`choose`] (name-
 //!   based selection) and [`index_from_name`] are pure and unit-tested on every
 //!   OS.
-//! - [`enumerate`] (the ioctl socket layer) is Linux-only; elsewhere it returns
-//!   an error.
+//! - [`enumerate`] and [`info`] (the ioctl socket layer) are Linux-only;
+//!   elsewhere they return an error.
 
 use crate::hci::format_addr_le;
 
@@ -117,13 +117,20 @@ pub fn index_from_name(name: &str) -> Option<u16> {
 // ===========================================================================
 
 #[cfg(target_os = "linux")]
-pub use linux_impl::enumerate;
+pub use linux_impl::{enumerate, info};
 
 /// Enumerate the host's Bluetooth adapters. This platform has no HCI ioctl
 /// interface, so this always fails.
 #[cfg(not(target_os = "linux"))]
 pub fn enumerate() -> Result<Vec<AdapterInfo>, String> {
     Err("Bluetooth adapter enumeration is only supported on Linux".to_string())
+}
+
+/// Query one adapter's info. This platform has no HCI ioctl interface, so
+/// this always fails.
+#[cfg(not(target_os = "linux"))]
+pub fn info(_dev: u16) -> Result<AdapterInfo, String> {
+    Err("Bluetooth adapter queries are only supported on Linux".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -193,6 +200,28 @@ mod linux_impl {
 
         unsafe { close(fd) };
         Ok(out)
+    }
+
+    /// Query one adapter's `hci_dev_info` on demand via `HCIGETDEVINFO`,
+    /// without enumerating: the address and the up/running flags as they are
+    /// right now.
+    pub fn info(dev: u16) -> Result<AdapterInfo, String> {
+        let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
+        if fd < 0 {
+            return Err(format!(
+                "cannot open HCI control socket (errno {}); need CAP_NET_RAW / root",
+                unsafe { errno() }
+            ));
+        }
+        let mut buf = vec![0u8; DEV_INFO_BUF];
+        buf[0..2].copy_from_slice(&dev.to_le_bytes());
+        let rc = unsafe { ioctl(fd, HCIGETDEVINFO, buf.as_mut_ptr() as *mut c_void) };
+        let e = unsafe { errno() };
+        unsafe { close(fd) };
+        if rc < 0 {
+            return Err(format!("HCIGETDEVINFO failed for hci{dev} (errno {e})"));
+        }
+        parse_dev_info(&buf).ok_or_else(|| format!("short hci_dev_info for hci{dev}"))
     }
 }
 
@@ -320,5 +349,11 @@ mod tests {
     #[test]
     fn enumerate_is_unsupported_off_linux() {
         assert!(enumerate().is_err());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn info_is_unsupported_off_linux() {
+        assert!(info(0).is_err());
     }
 }
