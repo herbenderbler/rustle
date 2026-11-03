@@ -19,8 +19,10 @@ use crate::hci::{format_uuid16, format_uuid32, AdvReport, ParsedAd};
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanFilter {
     /// Keep advertisements carrying at least one of these service UUIDs, in
-    /// the canonical lowercase 128-bit form the crate's parsers emit. Use
-    /// [`normalize_uuid`] to turn a 16- or 32-bit shorthand into that form.
+    /// the canonical lowercase 128-bit form the crate's parsers emit. The
+    /// UUID may appear in the advertised UUID list or as a service data
+    /// entry. Use [`normalize_uuid`] to turn a 16- or 32-bit shorthand into
+    /// that form.
     pub service_uuids: Vec<String>,
     /// Keep advertisements whose local name starts with this prefix.
     pub name_prefix: Option<String>,
@@ -43,7 +45,7 @@ impl ScanFilter {
             && !self
                 .service_uuids
                 .iter()
-                .any(|u| ad.service_uuids.contains(u))
+                .any(|u| ad.service_uuids.contains(u) || ad.service_data.contains_key(u))
         {
             return false;
         }
@@ -137,6 +139,27 @@ mod tests {
         assert!(f.matches(&ad(None, &[HRS, "other"], &[])));
         assert!(!f.matches(&ad(None, &["other"], &[])));
         assert!(!f.matches(&ad(None, &[], &[])));
+    }
+
+    #[test]
+    fn service_uuid_criterion_matches_service_data_keys() {
+        let f = ScanFilter {
+            service_uuids: vec![HRS.to_string()],
+            ..ScanFilter::default()
+        };
+        // A device may advertise a service only through its service data,
+        // with no UUID list at all.
+        let data_only = ParsedAd {
+            service_data: [(HRS.to_string(), vec![0x42])].into_iter().collect(),
+            ..ParsedAd::default()
+        };
+        assert!(data_only.service_uuids.is_empty());
+        assert!(f.matches(&data_only));
+        let other_data = ParsedAd {
+            service_data: [(BATT.to_string(), vec![0x42])].into_iter().collect(),
+            ..ParsedAd::default()
+        };
+        assert!(!f.matches(&other_data));
     }
 
     #[test]
