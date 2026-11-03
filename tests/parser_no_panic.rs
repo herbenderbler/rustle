@@ -41,6 +41,7 @@ impl Rng {
 fn feed_all(buf: &[u8]) {
     let _ = hci::parse_hci_packet(buf);
     let _ = hci::parse_ad_structures(buf);
+    let _ = hci::ad_structures(buf).count();
     let _ = hci::parse_le_advertising_report(buf);
     let _ = hci::parse_le_extended_advertising_report(buf);
     let _ = hci::is_adv_report_packet(buf);
