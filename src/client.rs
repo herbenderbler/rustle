@@ -378,6 +378,20 @@ impl<T: AttIo> GattClient<T> {
         Ok(())
     }
 
+    /// Read a descriptor's value (a plain read of its handle).
+    pub fn read_descriptor(&mut self, descriptor: &Descriptor) -> Result<Vec<u8>, GattError> {
+        self.read(descriptor.handle)
+    }
+
+    /// Write a descriptor's value (an acknowledged write to its handle).
+    pub fn write_descriptor(
+        &mut self,
+        descriptor: &Descriptor,
+        value: &[u8],
+    ) -> Result<(), GattError> {
+        self.write(descriptor.handle, value)
+    }
+
     /// Subscribe (or, with both `false`, unsubscribe) by writing the CCCD.
     pub fn subscribe(
         &mut self,
@@ -701,6 +715,21 @@ mod tests {
         assert!(client.io.sent.is_empty());
         client.write_without_response(0x0004, &[0u8; 20]).unwrap();
         assert_eq!(client.io.sent.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_helpers_target_the_descriptor_handle() {
+        // A Read Response, then a Write Response. The helpers must issue the
+        // same Read Request and Write Request a raw handle-based call would.
+        let mut client = GattClient::new(MockIo::new(vec![vec![0x0B, 0xAA], vec![0x13]]));
+        let descriptor = Descriptor {
+            handle: 0x0004,
+            uuid: gatt::CCCD_UUID.to_string(),
+        };
+        assert_eq!(client.read_descriptor(&descriptor).unwrap(), vec![0xAA]);
+        client.write_descriptor(&descriptor, &[0x01, 0x00]).unwrap();
+        assert_eq!(client.io.sent[0], vec![0x0A, 0x04, 0x00]);
+        assert_eq!(client.io.sent[1], vec![0x12, 0x04, 0x00, 0x01, 0x00]);
     }
 
     #[test]
