@@ -24,6 +24,8 @@ library.
   socket permissions and freeing the adapter from `bluetoothd`.
 - [USAGE.md](USAGE.md): a walk through scanning, filtering, connecting,
   GATT reads and writes, notifications and testing without a radio.
+- Examples: `examples/scan.rs` lists nearby devices and
+  `examples/battery.rs` connects to one and reads its battery level.
 - API reference: `cargo doc --open`.
 
 ## What's in the box

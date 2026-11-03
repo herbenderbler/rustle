@@ -67,9 +67,17 @@ Running the program as root works too.
 
 ## Free the adapter
 
-rustle sends scan commands straight to the controller. While `bluetoothd`
-runs, the kernel answers those commands with Command Disallowed. Stop the
-daemon before scanning:
+rustle sends scan commands straight to the controller. The kernel lets
+only one host stack drive a controller, and `bluetoothd` is that stack on
+most desktops. While it runs, raw scan commands fail with Command
+Disallowed.
+
+Stopping the daemon frees the controller. It also disconnects everything
+else on that adapter, such as a mouse or headphones, until the daemon is
+started again. Use a second adapter, such as a USB dongle, if you need
+both at once.
+
+Stop the daemon before scanning:
 
 ```bash
 sudo systemctl stop bluetooth
@@ -114,6 +122,10 @@ target/debug/examples/scan hci0 10
 Each line shows an address, the RSSI and the local name when the device
 sends one. A summary line gives the report count at the end. Pass another
 interface name or another number of seconds as needed.
+
+To go one step further, build `examples/battery.rs` the same way and run
+it with the start of a nearby device's name. It connects to the device
+and reads its battery level. [USAGE.md](USAGE.md) explains each step.
 
 ## Contributor checks
 

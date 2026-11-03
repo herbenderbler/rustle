@@ -6,7 +6,81 @@ map. [INSTALL.md](INSTALL.md) covers the toolchain, socket permissions and
 the adapter.
 
 Every Rust block in this file is compiled by `cargo test`, so the examples
-match the current API.
+match the current API. If BLE itself is new to you, start with Concepts
+and then run the first program.
+
+## Concepts
+
+BLE splits into a **controller** and a **host**. The controller is the
+radio chip. The host is the software that drives it, over an interface
+called **HCI**. On Linux the kernel owns the HCI link and exposes it as
+sockets. rustle talks to those sockets, so nothing else sits between your
+program and the radio.
+
+A device that wants to be found sends **advertisements**: small broadcast
+packets with a name, the services it offers, or vendor data. A **scan**
+listens for them. A **passive** scan only listens. An **active** scan also
+asks each device for a **scan response**, a second packet with more data.
+Many devices put their name in the scan response only.
+
+Every device has a 48 bit **address**, written `AA:BB:CC:DD:EE:FF`. A
+**public** address is fixed in hardware. A **random** address is chosen by
+the device, and some devices change it over time for privacy. Connecting
+needs the address and its kind. Both come from a scan report.
+
+A **connection** is a timed link between the host and one device. The
+kernel establishes it. Over the link runs **L2CAP**, a thin multiplexing
+layer, and on a fixed L2CAP channel runs **ATT**, the Attribute Protocol.
+ATT is a request and response protocol over a table of attributes on the
+device. Each attribute has a **handle**, a 16 bit index into the table, a
+**UUID** that says what it is, and a value.
+
+**GATT** gives that table a structure. A **service** groups related
+**characteristics**. A characteristic is one value, such as a battery
+level, plus properties that say whether it can be read, written or pushed
+to the client. A characteristic may own **descriptors** that configure it.
+Standard services and characteristics have 16 bit UUIDs assigned by the
+Bluetooth SIG. Vendor ones have 128 bit UUIDs. rustle writes every UUID in
+the 128 bit form, so Battery Level `0x2A19` appears as
+`00002a19-0000-1000-8000-00805f9b34fb`.
+
+Handles are not fixed by the UUID. They differ from device to device, so a
+client **discovers** the table first and then reads or writes by handle.
+The **MTU** is the largest ATT packet both sides accept. It starts at 23
+bytes, and the client can ask for more.
+
+A device can push a characteristic's value to the client. A
+**notification** is sent and forgotten. An **indication** must be
+confirmed. Both are switched on by writing the **Client Characteristic
+Configuration Descriptor**, or **CCCD**, that sits next to the
+characteristic.
+
+**RSSI** is received signal strength in dBm. Numbers closer to zero mean a
+stronger signal. Scan reports carry it, and a connection can be asked for
+it.
+
+## First program
+
+`examples/battery.rs` is a complete program that does the four things most
+BLE clients do. It scans until it hears a device whose name starts with a
+prefix, connects to it, discovers its attribute table, and reads the
+standard Battery Level characteristic. Build it, grant the capability and
+run it with the start of your device's name:
+
+```bash
+cargo build --example battery
+```
+
+```bash
+sudo setcap cap_net_raw+ep target/debug/examples/battery
+```
+
+```bash
+target/debug/examples/battery Polar
+```
+
+The sections below explain each step in the order the program takes
+them.
 
 ## Layering
 
@@ -178,6 +252,12 @@ up, which can take tens of seconds for a peer that is out of range.
 `connect_timeout` bounds the attempt and fails with `TimedOut`. Prefer it
 in anything interactive.
 
+Scan first to get the two things a connection needs. The report for your
+device carries its address, and its `addr_type` says whether that address
+is random. Pass `report.addr_type == AddrType::Random` as `peer_random`.
+A wrong flag makes the kernel look for a device that does not exist, and
+the connect times out.
+
 ```rust,no_run
 use rustle::client::GattClient;
 use rustle::l2cap::{L2capAtt, SecurityLevel};
@@ -209,6 +289,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `recv_timeout_secs` | Receive timeout in seconds. A notification loop uses it to check a shutdown flag. |
 | `timeout` | Only on `connect_timeout`. Upper bound on the connection attempt. |
 
+`SecurityLevel::Low` needs no pairing and works with most devices. `Medium`
+and `High` ask the kernel to pair and encrypt the link. Without
+`bluetoothd` there is no agent to answer a passkey prompt, so pairing only
+succeeds when the device accepts it without one. Stay on `Low` unless the
+device answers reads or writes with ATT error `0x05` or `0x0F`.
+
 Dropping the channel closes it. The kernel drops the link once nothing
 else uses it.
 
@@ -223,16 +309,26 @@ characteristics and each characteristic's descriptors. The parts are also
 available on their own as `discover_services`, `discover_characteristics`
 and `discover_descriptors`.
 
-Reads and writes address a characteristic by its value handle. `read`
-issues one Read Request. `read_long` follows it with Read Blob requests
-until the value ends. `write` waits for the server's response.
+Reads and writes address a characteristic by its value handle. The handle
+comes from discovery, never from the UUID, because every device lays its
+table out differently. Find the characteristic by UUID first, then use
+its `value_handle`. Standard UUIDs are listed in the Bluetooth SIG
+assigned numbers; see Further reading.
+
+`read` issues one Read Request. `read_long` follows it with Read Blob
+requests until the value ends. `write` waits for the server's response.
 `write_without_response` sends a Write Command and returns at once, so the
-value must fit in the MTU less three bytes.
+value must fit in the MTU less three bytes. Both writes take the same
+value handle and a byte slice.
 
 ```rust,no_run
 use rustle::client::GattClient;
 use rustle::l2cap::{L2capAtt, SecurityLevel};
 use std::time::Duration;
+
+// Battery Service 0x180F and its Battery Level characteristic 0x2A19.
+const BATTERY_SERVICE: &str = "0000180f-0000-1000-8000-00805f9b34fb";
+const BATTERY_LEVEL: &str = "00002a19-0000-1000-8000-00805f9b34fb";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let link = L2capAtt::connect_timeout(
@@ -242,21 +338,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mtu = client.exchange_mtu(247)?;
     println!("ATT MTU {mtu}");
 
-    for service in client.discover_all()? {
+    // Discover the whole table and print it, to see what the device offers.
+    let services = client.discover_all()?;
+    for service in &services {
         println!("service {}", service.service.uuid);
         for c in &service.characteristics {
             let ch = &c.characteristic;
             println!("  {} value handle {:#06x} props {:#04x}", ch.uuid, ch.value_handle, ch.properties);
-            for d in &c.descriptors {
-                println!("    descriptor {} handle {:#06x}", d.uuid, d.handle);
-            }
         }
     }
 
-    let value = client.read(0x0010)?;
-    println!("handle 0x0010 holds {value:?}");
-    client.write(0x0012, &[0x01])?;
-    client.write_without_response(0x0014, &[0x02])?;
+    // Find Battery Level inside the Battery Service and read it by handle.
+    let battery = services
+        .iter()
+        .find(|s| s.service.uuid == BATTERY_SERVICE)
+        .and_then(|s| s.characteristics.iter().find(|c| c.characteristic.uuid == BATTERY_LEVEL))
+        .ok_or("device has no Battery Level characteristic")?;
+    let level = client.read(battery.characteristic.value_handle)?;
+    println!("battery {}%", level.first().copied().unwrap_or(0));
     Ok(())
 }
 ```
@@ -264,9 +363,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Notifications
 
 A server pushes values to the client through notifications and
-indications. Both are enabled by writing the characteristic's Client
-Characteristic Configuration Descriptor, which `subscribe` does. Check
-`can_notify` or `can_indicate` on the characteristic first.
+indications. Both are off until the client asks for them by writing the
+characteristic's CCCD, a two byte descriptor that sits next to it.
+`subscribe` finds nothing on its own; give it the CCCD handle from
+discovery, as below. Check `can_notify` or `can_indicate` on the
+characteristic first.
 
 `next_event` returns the next pushed value and confirms indications on its
 own. It returns `Ok(None)` when the receive timeout elapses, so a loop can
@@ -421,3 +522,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   Only the pure layer works there.
 - **A read never returns.** The receive timeout is zero. Give `open` or
   `connect` a timeout.
+
+## Further reading
+
+- The Bluetooth SIG [assigned numbers](https://www.bluetooth.com/specifications/assigned-numbers/)
+  list every standard service, characteristic and descriptor UUID, and the
+  company identifiers used in manufacturer data.
+- The Bluetooth [Core Specification](https://www.bluetooth.com/specifications/specs/)
+  has the ATT and GATT chapters in the Host volume and the HCI commands in
+  the Host Controller Interface volume.
+- `btmon` from BlueZ prints every HCI packet the kernel sees. It is the
+  fastest way to learn what a device actually sends.
