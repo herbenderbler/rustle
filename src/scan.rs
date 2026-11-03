@@ -30,7 +30,10 @@
 //! [`HciScanner::start`] prefers the Bluetooth 5 *extended* scan command set
 //! (so extended-advertising PDUs are seen as well as the legacy adverts they
 //! wrap) and falls back to the legacy commands on a controller that rejects
-//! it; the returned [`ScanStart`] says which one took.
+//! it; the returned [`ScanStart`] says which one took. [`ScanPhys`] selects
+//! which PHYs an extended scan listens on: LE 1M (the default), the long
+//! range LE Coded PHY, or both. Legacy scanning is LE 1M only, so a
+//! Coded-only request does not fall back.
 
 use std::fmt;
 use std::io;
@@ -97,16 +100,50 @@ impl OwnAddrType {
     }
 }
 
+/// Which PHYs an extended scan listens on. The legacy command set is LE 1M
+/// only; the extended set can also listen on the long range LE Coded PHY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanPhys {
+    /// LE 1M only, the default.
+    M1,
+    /// The LE Coded (long range) PHY only. Legacy scanning cannot cover
+    /// this, so a controller that rejects the extended commands fails the
+    /// scan instead of silently listening on the wrong PHY.
+    Coded,
+    /// Both LE 1M and LE Coded.
+    M1AndCoded,
+}
+
+impl ScanPhys {
+    /// The HCI `Scanning_PHYs` bitmask: bit 0 is LE 1M, bit 2 is LE Coded.
+    pub fn as_mask(self) -> u8 {
+        match self {
+            ScanPhys::M1 => 0x01,
+            ScanPhys::Coded => 0x04,
+            ScanPhys::M1AndCoded => 0x05,
+        }
+    }
+
+    /// Whether a legacy 1M scan still covers part of this request, which is
+    /// what makes the legacy fallback meaningful when a controller rejects
+    /// the extended commands.
+    pub fn legacy_fallback_covers(self) -> bool {
+        !matches!(self, ScanPhys::Coded)
+    }
+}
+
 /// What to program the controller with. `interval` and `window` are in units
 /// of 0.625 ms; `window <= interval`, and equal values request a continuous
 /// listen. The filter policy is always "accept all" and duplicate filtering is
-/// always off, so every advertisement is reported.
+/// always off, so every advertisement is reported. `phys` applies to the
+/// extended command set only; legacy scanning is always LE 1M.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanParams {
     pub scan_type: ScanType,
     pub own_addr_type: OwnAddrType,
     pub interval: u16,
     pub window: u16,
+    pub phys: ScanPhys,
 }
 
 impl Default for ScanParams {
@@ -119,13 +156,14 @@ impl Default for ScanParams {
 
 impl ScanParams {
     /// `scan_type` / `own_addr_type` with the default continuous interval and
-    /// window.
+    /// window, listening on LE 1M.
     pub fn new(scan_type: ScanType, own_addr_type: OwnAddrType) -> Self {
         ScanParams {
             scan_type,
             own_addr_type,
             interval: DEFAULT_SCAN_INTERVAL,
             window: DEFAULT_SCAN_WINDOW,
+            phys: ScanPhys::M1,
         }
     }
 
@@ -145,22 +183,24 @@ impl ScanParams {
         ]
     }
 
-    /// Parameters for `LE Set Extended Scan Parameters` on the LE 1M PHY only:
-    /// `own_addr_type, filter_policy, scanning_PHYs, scan_type, interval(2),
-    /// window(2)`.
-    pub fn extended_params(&self) -> [u8; 8] {
+    /// Parameters for `LE Set Extended Scan Parameters`:
+    /// `own_addr_type, filter_policy, scanning_PHYs`, then one
+    /// `scan_type, interval(2), window(2)` triple per selected PHY, in
+    /// ascending bit order. The same type, interval and window are
+    /// programmed on every selected PHY.
+    pub fn extended_params(&self) -> Vec<u8> {
         let iv = self.interval.to_le_bytes();
         let win = self.window.to_le_bytes();
-        [
+        let mask = self.phys.as_mask();
+        let mut p = vec![
             self.own_addr_type.as_u8(),
             0x00, // filter_policy = accept all
-            0x01, // scanning_PHYs = LE 1M
-            self.scan_type.as_u8(),
-            iv[0],
-            iv[1],
-            win[0],
-            win[1],
-        ]
+            mask,
+        ];
+        for _ in 0..mask.count_ones() {
+            p.extend_from_slice(&[self.scan_type.as_u8(), iv[0], iv[1], win[0], win[1]]);
+        }
+        p
     }
 }
 
@@ -409,6 +449,12 @@ mod linux_impl {
                     fallback: None,
                 },
                 Err(ext_err) => {
+                    // A Coded-only request has no legacy equivalent: a 1M
+                    // legacy scan would listen on the wrong PHY, so the
+                    // rejection is surfaced instead of narrowing the request.
+                    if !params.phys.legacy_fallback_covers() {
+                        return Err(ext_err);
+                    }
                     self.start_legacy(&params)?;
                     ScanStart {
                         mode: ScanMode::Legacy,
@@ -577,6 +623,7 @@ mod tests {
         assert_eq!(p.own_addr_type, OwnAddrType::Public);
         assert_eq!(p.interval, DEFAULT_SCAN_INTERVAL);
         assert_eq!(p.window, DEFAULT_SCAN_WINDOW);
+        assert_eq!(p.phys, ScanPhys::M1);
         // Continuous listen: window == interval.
         assert_eq!(p.interval, p.window);
     }
@@ -599,6 +646,7 @@ mod tests {
             own_addr_type: OwnAddrType::Random,
             interval: 0x1234,
             window: 0x0010,
+            phys: ScanPhys::M1,
         };
         assert_eq!(
             p.legacy_params(),
@@ -618,14 +666,58 @@ mod tests {
             own_addr_type: OwnAddrType::Random,
             interval: 0x1234,
             window: 0x0010,
+            phys: ScanPhys::M1,
         };
         assert_eq!(
             p.extended_params(),
-            [0x01, 0x00, 0x01, 0x01, 0x34, 0x12, 0x10, 0x00]
+            vec![0x01, 0x00, 0x01, 0x01, 0x34, 0x12, 0x10, 0x00]
         );
         let p = ScanParams::default();
         assert_eq!(p.extended_params()[0], 0x00); // public
         assert_eq!(p.extended_params()[3], 0x00); // passive
+    }
+
+    #[test]
+    fn extended_params_emit_one_triple_per_phy() {
+        // Coded only: mask 0x04, a single triple.
+        let mut p = ScanParams {
+            phys: ScanPhys::Coded,
+            ..ScanParams::default()
+        };
+        assert_eq!(
+            p.extended_params(),
+            vec![0x00, 0x00, 0x04, 0x00, 0x10, 0x00, 0x10, 0x00]
+        );
+        // Both PHYs: mask 0x05, the same triple twice (1M first, Coded
+        // second, in ascending bit order).
+        p.phys = ScanPhys::M1AndCoded;
+        assert_eq!(
+            p.extended_params(),
+            vec![
+                0x00, 0x00, 0x05, // header
+                0x00, 0x10, 0x00, 0x10, 0x00, // LE 1M triple
+                0x00, 0x10, 0x00, 0x10, 0x00, // LE Coded triple
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_phys_masks_follow_the_spec() {
+        // Bit 0 is LE 1M and bit 2 is LE Coded; bit 1 (LE 2M) is not valid
+        // for scanning, so no variant may ever set it.
+        assert_eq!(ScanPhys::M1.as_mask(), 0x01);
+        assert_eq!(ScanPhys::Coded.as_mask(), 0x04);
+        assert_eq!(ScanPhys::M1AndCoded.as_mask(), 0x05);
+        for phys in [ScanPhys::M1, ScanPhys::Coded, ScanPhys::M1AndCoded] {
+            assert_eq!(phys.as_mask() & 0x02, 0);
+        }
+    }
+
+    #[test]
+    fn only_requests_covering_1m_allow_the_legacy_fallback() {
+        assert!(ScanPhys::M1.legacy_fallback_covers());
+        assert!(ScanPhys::M1AndCoded.legacy_fallback_covers());
+        assert!(!ScanPhys::Coded.legacy_fallback_covers());
     }
 
     #[test]

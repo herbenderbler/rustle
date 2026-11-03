@@ -93,9 +93,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `ScanParams::default()` is a passive scan: the controller only listens.
 `HciScanner::start` prefers the Bluetooth 5 extended scan commands and
-falls back to the legacy ones on a controller that rejects them. Dropping
-the scanner stops the scan and closes the socket. [USAGE.md](USAGE.md)
-covers active scans, scan response merging and filtering.
+falls back to the legacy ones on a controller that rejects them.
+`ScanParams::phys` selects the PHYs an extended scan listens on: LE 1M,
+the long range LE Coded PHY, or both. A Coded-only scan has no legacy
+equivalent, so it fails rather than falling back. Dropping the scanner
+stops the scan and closes the socket. [USAGE.md](USAGE.md) covers active
+scans, scan response merging and filtering.
 
 ## GATT
 
