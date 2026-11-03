@@ -11,6 +11,7 @@
 //! the pairing / flush behaviour is unit-tested without real time.
 
 use crate::hci::{AddrType, AdvPdu, AdvReport, ParsedAd};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,21 @@ struct Pending {
     rssi: Option<i32>,
     ad: ParsedAd,
     since: Instant,
+}
+
+impl Pending {
+    /// Release the hold as the advertisement for `address`, carrying whatever
+    /// this primary accumulated while it waited. This is the one place a
+    /// `MergedAdv` is assembled from a `Pending`, whether its response arrived
+    /// or it went stale.
+    fn into_adv(self, address: String) -> MergedAdv {
+        MergedAdv {
+            address,
+            addr_type: self.addr_type,
+            rssi: self.rssi,
+            ad: self.ad,
+        }
+    }
 }
 
 /// Pairs scannable primaries with their scan responses, per device.
@@ -76,12 +92,10 @@ impl ScanMerger {
                 if let Some(mut p) = self.pending.remove(&report.address) {
                     p.ad.merge_scan_response(report.ad);
                     vec![MergedAdv {
-                        address: report.address,
-                        addr_type: p.addr_type,
                         // Prefer the response's RSSI (the fresher sample), falling
                         // back to the primary's if the response had none.
                         rssi: report.rssi.or(p.rssi),
-                        ad: p.ad,
+                        ..p.into_adv(report.address)
                     }]
                 } else {
                     vec![MergedAdv::from_report(report)]
@@ -95,23 +109,21 @@ impl ScanMerger {
                 // sight would classify before the response could complete it. The
                 // original `since` is preserved, so a device that re-advertises
                 // faster than `wait` still flushes on schedule.
-                match self.pending.get_mut(&report.address) {
-                    Some(p) => {
+                match self.pending.entry(report.address) {
+                    Entry::Occupied(held) => {
+                        let p = held.into_mut();
                         p.ad.merge_scan_response(report.ad);
                         if report.rssi.is_some() {
                             p.rssi = report.rssi; // freshest sample
                         }
                     }
-                    None => {
-                        self.pending.insert(
-                            report.address,
-                            Pending {
-                                addr_type: report.addr_type,
-                                rssi: report.rssi,
-                                ad: report.ad,
-                                since: now,
-                            },
-                        );
+                    Entry::Vacant(slot) => {
+                        slot.insert(Pending {
+                            addr_type: report.addr_type,
+                            rssi: report.rssi,
+                            ad: report.ad,
+                            since: now,
+                        });
                     }
                 }
                 Vec::new()
@@ -124,23 +136,9 @@ impl ScanMerger {
     /// Call once per read-loop iteration so a device that emits a primary but no
     /// response is still surfaced promptly, and the pending map stays bounded.
     pub fn flush_stale(&mut self, now: Instant) -> Vec<MergedAdv> {
-        let ready: Vec<String> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| now.saturating_duration_since(p.since) >= self.wait)
-            .map(|(mac, _)| mac.clone())
-            .collect();
-        ready
-            .into_iter()
-            .map(|mac| {
-                let p = self.pending.remove(&mac).expect("just collected");
-                MergedAdv {
-                    address: mac,
-                    addr_type: p.addr_type,
-                    rssi: p.rssi,
-                    ad: p.ad,
-                }
-            })
+        self.pending
+            .extract_if(|_, p| now.saturating_duration_since(p.since) >= self.wait)
+            .map(|(address, p)| p.into_adv(address))
             .collect()
     }
 }
@@ -279,5 +277,38 @@ mod tests {
         let out = m.flush_stale(now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].address, "AA");
+    }
+
+    #[test]
+    fn flush_stale_emits_only_the_stale_primaries() {
+        let start = t0();
+        let mut m = ScanMerger::new(Duration::from_millis(1500));
+        assert!(m
+            .offer(
+                report("AA", AdvPdu::ScannablePrimary, Some("x"), &[]),
+                start
+            )
+            .is_empty());
+        // A second device is held 1s later, so the two go stale at different times.
+        let later = start + Duration::from_millis(1000);
+        assert!(m
+            .offer(
+                report("BB", AdvPdu::ScannablePrimary, Some("y"), &[]),
+                later
+            )
+            .is_empty());
+        // 1600ms after the first advert (only 600ms after the second) AA alone is
+        // stale: it is emitted and BB stays held.
+        let out = m.flush_stale(start + Duration::from_millis(1600));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].address, "AA");
+        assert!(m
+            .flush_stale(start + Duration::from_millis(1700))
+            .is_empty());
+        // Once BB's own wait has elapsed it is emitted too, and nothing remains.
+        let out = m.flush_stale(later + Duration::from_millis(1600));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].address, "BB");
+        assert!(m.flush_stale(later + Duration::from_secs(10)).is_empty());
     }
 }
