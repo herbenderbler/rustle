@@ -9,7 +9,7 @@
 //! Malformed or truncated input never panics: parsing stops at the first bad
 //! structure and returns whatever was decoded before it.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 // ---------------------------------------------------------------------------
 // AD (Advertising Data) structure type codes — Bluetooth Core, "Assigned
@@ -62,47 +62,63 @@ impl ParsedAd {
     /// primary commonly carries only the *shortened* name and puts the complete
     /// name in the SCAN_RSP.
     pub fn merge_scan_response(&mut self, rsp: ParsedAd) {
-        match (&self.local_name, rsp.local_name) {
-            (None, Some(n)) => self.local_name = Some(n),
-            (Some(cur), Some(n)) if n.len() > cur.len() => self.local_name = Some(n),
-            _ => {}
-        }
-        for uuid in rsp.service_uuids {
-            if !self.service_uuids.contains(&uuid) {
-                self.service_uuids.push(uuid);
+        *self = std::mem::take(self).merged(rsp);
+    }
+
+    /// The union of this advertisement and `other`, with `self` taking precedence.
+    /// A longer local name from `other` replaces a shorter or absent one, and ties
+    /// keep `self`'s. Service UUIDs are the union in order of first appearance.
+    /// Manufacturer data and service data keep the longer payload per key, ties
+    /// keeping `self`'s, since a response often carries the richer copy of an
+    /// entry the primary only announces. Appearance and TX power come from `self`
+    /// unless absent. The merge never drops a key present on either side.
+    pub fn merged(self, other: ParsedAd) -> ParsedAd {
+        let mut service_uuids = self.service_uuids;
+        for uuid in other.service_uuids {
+            if !service_uuids.contains(&uuid) {
+                service_uuids.push(uuid);
             }
         }
-        for (company, data) in rsp.manufacturer_data {
-            // Keep the longer payload on a company-ID conflict. A device can emit
-            // the bare vendor ID in the primary and the same ID *with* its serial
-            // in the response, and the richer copy is the one a consumer needs —
-            // so a plain "primary wins" would drop the serial.
-            let replace = match self.manufacturer_data.get(&company) {
-                Some(existing) => data.len() > existing.len(),
-                None => true,
-            };
-            if replace {
-                self.manufacturer_data.insert(company, data);
-            }
-        }
-        for (uuid, data) in rsp.service_data {
-            // Same rule as manufacturer data: the longer payload survives a
-            // conflict, so a response that enriches the primary's entry wins.
-            let replace = match self.service_data.get(&uuid) {
-                Some(existing) => data.len() > existing.len(),
-                None => true,
-            };
-            if replace {
-                self.service_data.insert(uuid, data);
-            }
-        }
-        if self.appearance.is_none() {
-            self.appearance = rsp.appearance;
-        }
-        if self.tx_power.is_none() {
-            self.tx_power = rsp.tx_power;
+        ParsedAd {
+            local_name: longer(self.local_name, other.local_name, String::len),
+            service_uuids,
+            manufacturer_data: union_longer(self.manufacturer_data, other.manufacturer_data),
+            service_data: union_longer(self.service_data, other.service_data),
+            appearance: self.appearance.or(other.appearance),
+            tx_power: self.tx_power.or(other.tx_power),
         }
     }
+}
+
+/// Keep `new` only when it is strictly longer than `cur`; a tie keeps `cur`,
+/// and an absent side yields the other.
+fn longer<T>(cur: Option<T>, new: Option<T>, len: impl Fn(&T) -> usize) -> Option<T> {
+    match (cur, new) {
+        (Some(c), Some(n)) if len(&n) > len(&c) => Some(n),
+        (Some(c), _) => Some(c),
+        (None, n) => n,
+    }
+}
+
+/// The union of two maps, keeping the longer payload for a key present in
+/// both; a tie keeps `into`'s.
+fn union_longer<K: Eq + std::hash::Hash>(
+    mut into: HashMap<K, Vec<u8>>,
+    from: HashMap<K, Vec<u8>>,
+) -> HashMap<K, Vec<u8>> {
+    for (key, data) in from {
+        match into.entry(key) {
+            Entry::Occupied(mut slot) => {
+                if data.len() > slot.get().len() {
+                    slot.insert(data);
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(data);
+            }
+        }
+    }
+    into
 }
 
 /// Advertising address type reported by the controller in a report header.
@@ -914,6 +930,192 @@ mod tests {
             ..ParsedAd::default()
         });
         assert_eq!(primary.local_name.as_deref(), Some("Beacon-7"));
+    }
+
+    #[test]
+    fn merged_is_idempotent() {
+        // Merging a fully populated value with itself changes nothing: every
+        // per-field rule is a tie that keeps `self`'s copy, or a union of equals.
+        let a = ParsedAd {
+            local_name: Some("Beacon-7".to_string()),
+            service_uuids: vec!["a".to_string(), "b".to_string()],
+            manufacturer_data: HashMap::from([(0x09C8, vec![1, 2, 3]), (0x00E0, vec![4])]),
+            service_data: HashMap::from([
+                ("sd-a".to_string(), vec![5, 6]),
+                ("sd-b".to_string(), vec![]),
+            ]),
+            appearance: Some(0x0341),
+            tx_power: Some(-4),
+        };
+        assert_eq!(a.clone().merged(a.clone()), a);
+    }
+
+    #[test]
+    fn merged_keeps_self_on_equal_length() {
+        // A tie on length goes to `self`: an equal-length name or payload from
+        // `other` never displaces the copy already held.
+        let a = ParsedAd {
+            local_name: Some("Bcn".to_string()),
+            manufacturer_data: HashMap::from([(0x09C8, vec![1, 2])]),
+            service_data: HashMap::from([("sd".to_string(), vec![3, 4])]),
+            ..ParsedAd::default()
+        };
+        let b = ParsedAd {
+            local_name: Some("Xyz".to_string()),
+            manufacturer_data: HashMap::from([(0x09C8, vec![9, 9])]),
+            service_data: HashMap::from([("sd".to_string(), vec![8, 8])]),
+            ..ParsedAd::default()
+        };
+        let merged = a.merged(b);
+        assert_eq!(merged.local_name.as_deref(), Some("Bcn"));
+        assert_eq!(merged.manufacturer_data.get(&0x09C8), Some(&vec![1, 2]));
+        assert_eq!(merged.service_data.get("sd"), Some(&vec![3, 4]));
+    }
+
+    #[test]
+    fn merged_keeps_every_key_from_both_sides() {
+        // Disjoint keys all survive, and a service UUID seen on both sides is
+        // listed once, in order of first appearance.
+        let a = ParsedAd {
+            service_uuids: vec!["a".to_string(), "b".to_string()],
+            manufacturer_data: HashMap::from([(0x0001, vec![1]), (0x0002, vec![2])]),
+            service_data: HashMap::from([
+                ("sd-1".to_string(), vec![1]),
+                ("sd-2".to_string(), vec![2]),
+            ]),
+            ..ParsedAd::default()
+        };
+        let b = ParsedAd {
+            service_uuids: vec!["b".to_string(), "c".to_string()],
+            manufacturer_data: HashMap::from([(0x0003, vec![3]), (0x0004, vec![4])]),
+            service_data: HashMap::from([
+                ("sd-3".to_string(), vec![3]),
+                ("sd-4".to_string(), vec![4]),
+            ]),
+            ..ParsedAd::default()
+        };
+        let merged = a.merged(b);
+        assert_eq!(
+            merged.service_uuids,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            merged.manufacturer_data,
+            HashMap::from([
+                (0x0001, vec![1]),
+                (0x0002, vec![2]),
+                (0x0003, vec![3]),
+                (0x0004, vec![4]),
+            ])
+        );
+        assert_eq!(
+            merged.service_data,
+            HashMap::from([
+                ("sd-1".to_string(), vec![1]),
+                ("sd-2".to_string(), vec![2]),
+                ("sd-3".to_string(), vec![3]),
+                ("sd-4".to_string(), vec![4]),
+            ])
+        );
+    }
+
+    #[test]
+    fn merged_is_associative() {
+        // Every per-field rule is either a union or "leftmost of the longest",
+        // so the grouping of a three-way merge must not matter. The values
+        // below hit ties and strict length differences in both directions.
+        let a = ParsedAd {
+            local_name: Some("Bcn".to_string()),
+            service_uuids: vec!["a".to_string(), "b".to_string()],
+            manufacturer_data: HashMap::from([(0x09C8, vec![1, 2]), (0x00E0, vec![1])]),
+            service_data: HashMap::from([
+                ("sd-a".to_string(), vec![1, 2, 3]),
+                ("sd-b".to_string(), vec![]),
+            ]),
+            appearance: None,
+            tx_power: Some(-4),
+        };
+        let b = ParsedAd {
+            local_name: Some("Beacon-7".to_string()), // longer than a's
+            service_uuids: vec!["b".to_string(), "c".to_string()],
+            manufacturer_data: HashMap::from([
+                (0x09C8, vec![9, 9]),    // ties with a's
+                (0x1234, vec![5, 5, 5]), // new company
+            ]),
+            service_data: HashMap::from([
+                ("sd-a".to_string(), vec![7]),    // shorter than a's
+                ("sd-c".to_string(), vec![4, 4]), // new service
+            ]),
+            appearance: Some(0x0341),
+            tx_power: None,
+        };
+        let c = ParsedAd {
+            local_name: Some("Beacon-8".to_string()), // ties with b's
+            service_uuids: vec!["c".to_string(), "a".to_string(), "d".to_string()],
+            manufacturer_data: HashMap::from([
+                (0x09C8, vec![3, 3, 3]), // longer than both
+                (0x00E0, vec![2]),       // ties with a's
+                (0x1234, vec![6, 6]),    // shorter than b's
+            ]),
+            service_data: HashMap::from([
+                ("sd-b".to_string(), vec![1]),    // longer than a's
+                ("sd-c".to_string(), vec![5, 5]), // ties with b's
+                ("sd-d".to_string(), vec![9]),    // new service
+            ]),
+            appearance: Some(0x0000),
+            tx_power: Some(8),
+        };
+        let left = a.clone().merged(b.clone()).merged(c.clone());
+        let right = a.merged(b.merged(c));
+        assert_eq!(left, right);
+        // And the result is the leftmost of the longest on every contested key.
+        assert_eq!(left.local_name.as_deref(), Some("Beacon-7"));
+        assert_eq!(
+            left.service_uuids,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ]
+        );
+        assert_eq!(left.manufacturer_data.get(&0x09C8), Some(&vec![3, 3, 3]));
+        assert_eq!(left.manufacturer_data.get(&0x00E0), Some(&vec![1]));
+        assert_eq!(left.manufacturer_data.get(&0x1234), Some(&vec![5, 5, 5]));
+        assert_eq!(left.service_data.get("sd-a"), Some(&vec![1, 2, 3]));
+        assert_eq!(left.service_data.get("sd-b"), Some(&vec![1]));
+        assert_eq!(left.service_data.get("sd-c"), Some(&vec![4, 4]));
+        assert_eq!(left.service_data.get("sd-d"), Some(&vec![9]));
+        assert_eq!(left.appearance, Some(0x0341));
+        assert_eq!(left.tx_power, Some(-4));
+    }
+
+    #[test]
+    fn merge_scan_response_delegates_to_merged() {
+        // The mutating entry point and the value-level one agree on the same
+        // inputs.
+        let primary = ParsedAd {
+            local_name: Some("Bcn".to_string()),
+            service_uuids: vec!["a".to_string()],
+            manufacturer_data: HashMap::from([(0x09C8, vec![1])]),
+            service_data: HashMap::from([("sd-a".to_string(), vec![1, 2])]),
+            appearance: None,
+            tx_power: Some(-4),
+        };
+        let rsp = ParsedAd {
+            local_name: Some("Beacon-7".to_string()),
+            service_uuids: vec!["a".to_string(), "b".to_string()],
+            manufacturer_data: HashMap::from([(0x09C8, b"TN12345678".to_vec()), (0x00E0, vec![3])]),
+            service_data: HashMap::from([
+                ("sd-a".to_string(), vec![9, 9]),
+                ("sd-b".to_string(), vec![3]),
+            ]),
+            appearance: Some(0x0341),
+            tx_power: None,
+        };
+        let mut mutated = primary.clone();
+        mutated.merge_scan_response(rsp.clone());
+        assert_eq!(mutated, primary.merged(rsp));
     }
 
     #[test]
