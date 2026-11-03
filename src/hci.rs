@@ -52,8 +52,8 @@ pub struct ParsedAd {
 impl ParsedAd {
     /// Fold a `SCAN_RSP`'s decoded AD into this primary advertisement's, taking
     /// the union of the two halves. A raw-HCI scanner delivers ADV_IND and its
-    /// SCAN_RSP as separate report events; general-purpose stacks (btleplug,
-    /// BlueZ over D-Bus) surface them already combined, so merging here restores
+    /// SCAN_RSP as separate report events; general-purpose stacks such as
+    /// BlueZ over D-Bus surface them already combined, so merging here restores
     /// that parity (a device that splits its identifying fields across the two
     /// is seen as a whole, not each half alone).
     ///

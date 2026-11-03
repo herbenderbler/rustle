@@ -1,8 +1,8 @@
 //! Adversarial-input no-panic harness for the BLE byte parsers.
 //!
 //! The whole point of the in-house stack is that attacker-controlled
-//! advertisement / ATT bytes are decoded in **safe Rust** rather than the C
-//! (`libdbus` → `dbus`) that btleplug pulled in. "Safe" still requires that a
+//! advertisement / ATT bytes are decoded in **safe Rust** rather than in a C
+//! library behind a D-Bus binding. "Safe" still requires that a
 //! malformed frame can't *panic* — an unhandled slice index or arithmetic
 //! overflow on a hostile advertisement would be a remote DoS of the scanner. So
 //! this feeds a large, deterministic mix of random and seed-mutated byte strings

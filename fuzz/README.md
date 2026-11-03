@@ -1,8 +1,8 @@
 # Fuzzing the rustle byte parsers
 
 The BLE stack decodes attacker-controlled advertisement and ATT bytes in **safe
-Rust** — the reason the C `libdbus` → `dbus` chain that btleplug pulled in was
-removed. These coverage-guided [`cargo fuzz`][cf] targets hunt for any input that
+Rust**, with no C library behind a D-Bus binding in the path. These
+coverage-guided [`cargo fuzz`][cf] targets hunt for any input that
 makes a parser **panic**: a panic on a hostile advertisement or ATT PDU is a
 remote DoS of the scanner / interact client, not just a bug.
 
