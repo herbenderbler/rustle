@@ -127,6 +127,47 @@ To go one step further, build `examples/battery.rs` the same way and run
 it with the start of a nearby device's name. It connects to the device
 and reads its battery level. [USAGE.md](USAGE.md) explains each step.
 
+## Test in a container
+
+The repository's `Dockerfile` builds rustle and both examples on the latest
+Ubuntu LTS, with the BlueZ tools installed. It is a quick way to try the
+examples against a real adapter without touching the toolchain on the
+machine. Build the image from the repository root:
+
+```bash
+docker build -t rustle .
+```
+
+The container needs three things to reach a controller. Bluetooth sockets
+belong to the network namespace, so it must share the machine's with
+`--net=host`. `NET_RAW` opens the raw sockets. `NET_ADMIN` lets `btmgmt`
+power the adapter on. The machine's `bluetoothd` still owns the controller
+from inside the container, so stop it first, as described above.
+
+```bash
+docker run --rm -it --net=host --cap-add=NET_RAW --cap-add=NET_ADMIN rustle
+```
+
+Inside the container you are root, so `setcap` is not needed. Bring the
+adapter up and run the examples:
+
+```bash
+btmgmt power on
+```
+
+```bash
+target/debug/examples/scan hci0 10
+```
+
+```bash
+target/debug/examples/battery Polar
+```
+
+`btmgmt --index 1 power on` targets a second adapter. `cargo test --locked`
+inside the container runs the suite on Ubuntu's libc. Pass
+`--build-arg UBUNTU_VERSION=24.04` to `docker build` to try another
+release.
+
 ## Contributor checks
 
 CI runs three checks beyond the tests. Run them before opening a pull
