@@ -97,3 +97,9 @@ pub mod scan_merge;
 
 #[cfg(target_os = "linux")]
 mod sys;
+
+// Compile the code blocks in USAGE.md under `cargo test`, so the guide
+// cannot drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../USAGE.md")]
+mod usage_guide {}
