@@ -461,6 +461,24 @@ impl<T: AttIo> GattClient<T> {
     }
 }
 
+/// Find the characteristic a value handle belongs to, with its service, in a
+/// discovered GATT tree (the output of [`GattClient::discover_all`]). A
+/// notification or indication PDU carries only the value handle, so this is
+/// the lookup that labels an event from [`GattClient::next_event`].
+pub fn find_characteristic(
+    services: &[DiscoveredService],
+    value_handle: u16,
+) -> Option<(&Service, &Characteristic)> {
+    for ds in services {
+        for dc in &ds.characteristics {
+            if dc.characteristic.value_handle == value_handle {
+                return Some((&ds.service, &dc.characteristic));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,6 +776,65 @@ mod tests {
         assert_eq!(ch.descriptors.len(), 1);
         assert_eq!(ch.descriptors[0].handle, 0x0004);
         assert_eq!(ch.descriptors[0].uuid, gatt::CCCD_UUID);
+    }
+
+    #[test]
+    fn find_characteristic_resolves_a_value_handle_to_its_service_and_char() {
+        let services = vec![
+            DiscoveredService {
+                service: Service {
+                    start_handle: 0x0001,
+                    end_handle: 0x0005,
+                    uuid: "00001800-0000-1000-8000-00805f9b34fb".into(),
+                },
+                characteristics: vec![DiscoveredCharacteristic {
+                    characteristic: Characteristic {
+                        decl_handle: 0x0002,
+                        properties: 0x02,
+                        value_handle: 0x0003,
+                        uuid: "00002a00-0000-1000-8000-00805f9b34fb".into(),
+                    },
+                    descriptors: vec![],
+                }],
+            },
+            DiscoveredService {
+                service: Service {
+                    start_handle: 0x0010,
+                    end_handle: 0x001F,
+                    uuid: "0000180f-0000-1000-8000-00805f9b34fb".into(),
+                },
+                characteristics: vec![
+                    DiscoveredCharacteristic {
+                        characteristic: Characteristic {
+                            decl_handle: 0x0011,
+                            properties: 0x10,
+                            value_handle: 0x0012,
+                            uuid: "00002a19-0000-1000-8000-00805f9b34fb".into(),
+                        },
+                        descriptors: vec![],
+                    },
+                    DiscoveredCharacteristic {
+                        characteristic: Characteristic {
+                            decl_handle: 0x0014,
+                            properties: 0x02,
+                            value_handle: 0x0015,
+                            uuid: "00002a1a-0000-1000-8000-00805f9b34fb".into(),
+                        },
+                        descriptors: vec![],
+                    },
+                ],
+            },
+        ];
+
+        // A hit returns the characteristic together with its owning service.
+        let (svc, ch) = find_characteristic(&services, 0x0012).unwrap();
+        assert_eq!(svc.uuid, "0000180f-0000-1000-8000-00805f9b34fb");
+        assert_eq!(ch.uuid, "00002a19-0000-1000-8000-00805f9b34fb");
+
+        // An unknown handle resolves to nothing.
+        assert!(find_characteristic(&services, 0x00FF).is_none());
+        // A declaration handle is not a value handle, so it must not match.
+        assert!(find_characteristic(&services, 0x0011).is_none());
     }
 
     #[test]
