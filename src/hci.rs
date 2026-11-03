@@ -266,70 +266,81 @@ pub fn format_uuid128(le: &[u8; 16]) -> String {
     )
 }
 
+/// The AD structures in an advertisement payload, as `(ad_type, value)` pairs
+/// in wire order. This is framing only; [`parse_ad_structures`] interprets the
+/// types the crate decodes, and this iterator exposes the rest. Iteration stops
+/// at a zero length byte, which terminates the list, or at a structure that
+/// claims more bytes than remain, and never panics.
+pub fn ad_structures(data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        // Each structure is `[len][type][len - 1 bytes of value]`, so `len`
+        // counts the type byte as well as the value bytes.
+        let (&len, after_len) = rest.split_first()?;
+        if len == 0 {
+            return None;
+        }
+        let (body, tail) = after_len.split_at_checked(len as usize)?;
+        // `len` is at least one here, so the body always holds the type byte.
+        let (&ad_type, value) = body.split_first()?;
+        rest = tail;
+        Some((ad_type, value))
+    })
+}
+
 /// Decode an advertisement's AD payload into [`ParsedAd`].
 ///
 /// AD structures are length-prefixed: `[len][type][len-1 bytes of data]…`.
-/// Malformed or truncated structures terminate parsing without panicking; any
-/// fields decoded before the truncation are kept.
+/// Framing is done by [`ad_structures`], so a malformed or truncated structure
+/// terminates parsing without panicking; any fields decoded before it are kept.
 pub fn parse_ad_structures(data: &[u8]) -> ParsedAd {
-    let mut out = ParsedAd::default();
-    let mut i = 0usize;
+    ad_structures(data).fold(ParsedAd::default(), |ad, (ad_type, value)| {
+        ad.with_structure(ad_type, value)
+    })
+}
 
-    while i < data.len() {
-        let len = data[i] as usize;
-        if len == 0 {
-            break; // zero-length terminates the AD list
-        }
-        // `len` counts the type byte plus the value bytes.
-        let type_idx = i + 1;
-        let value_start = i + 2;
-        let value_end = i + 1 + len;
-        // `len >= 1` here (0 broke above), so `value_end = i+1+len > type_idx =
-        // i+1`; a `type_idx >= data.len()` would therefore already trip
-        // `value_end > data.len()`, making that disjunct dead.
-        if value_end > data.len() {
-            break; // truncated structure
-        }
-        let ad_type = data[type_idx];
-        let value = &data[value_start..value_end];
-
+impl ParsedAd {
+    /// Fold one framed AD structure into the decoded fields. AD types the crate
+    /// does not decode, and values too short for their type, leave the fields
+    /// unchanged.
+    fn with_structure(mut self, ad_type: u8, value: &[u8]) -> ParsedAd {
         match ad_type {
             AD_COMPLETE_LOCAL_NAME | AD_SHORTENED_LOCAL_NAME => {
-                out.local_name = Some(String::from_utf8_lossy(value).to_string());
+                self.local_name = Some(String::from_utf8_lossy(value).to_string());
             }
             AD_INCOMPLETE_16BIT_UUIDS | AD_COMPLETE_16BIT_UUIDS => {
                 for chunk in value.as_chunks::<2>().0 {
                     let v = u16::from_le_bytes(*chunk);
-                    out.service_uuids.push(format_uuid16(v));
+                    self.service_uuids.push(format_uuid16(v));
                 }
             }
             AD_INCOMPLETE_32BIT_UUIDS | AD_COMPLETE_32BIT_UUIDS => {
                 for chunk in value.as_chunks::<4>().0 {
                     let v = u32::from_le_bytes(*chunk);
-                    out.service_uuids.push(format_uuid32(v));
+                    self.service_uuids.push(format_uuid32(v));
                 }
             }
             AD_INCOMPLETE_128BIT_UUIDS | AD_COMPLETE_128BIT_UUIDS => {
                 for chunk in value.as_chunks::<16>().0 {
-                    out.service_uuids.push(format_uuid128(chunk));
+                    self.service_uuids.push(format_uuid128(chunk));
                 }
             }
             AD_MANUFACTURER_DATA => {
                 if value.len() >= 2 {
                     let company = u16::from_le_bytes([value[0], value[1]]);
-                    out.manufacturer_data.insert(company, value[2..].to_vec());
+                    self.manufacturer_data.insert(company, value[2..].to_vec());
                 }
             }
             AD_SERVICE_DATA_16BIT => {
                 if value.len() >= 2 {
                     let uuid = format_uuid16(u16::from_le_bytes([value[0], value[1]]));
-                    out.service_data.insert(uuid, value[2..].to_vec());
+                    self.service_data.insert(uuid, value[2..].to_vec());
                 }
             }
             AD_SERVICE_DATA_32BIT => {
                 if value.len() >= 4 {
                     let v = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
-                    out.service_data
+                    self.service_data
                         .insert(format_uuid32(v), value[4..].to_vec());
                 }
             }
@@ -337,27 +348,24 @@ pub fn parse_ad_structures(data: &[u8]) -> ParsedAd {
                 if value.len() >= 16 {
                     let mut uuid_le = [0u8; 16];
                     uuid_le.copy_from_slice(&value[..16]);
-                    out.service_data
+                    self.service_data
                         .insert(format_uuid128(&uuid_le), value[16..].to_vec());
                 }
             }
             AD_APPEARANCE => {
                 if value.len() >= 2 {
-                    out.appearance = Some(u16::from_le_bytes([value[0], value[1]]));
+                    self.appearance = Some(u16::from_le_bytes([value[0], value[1]]));
                 }
             }
             AD_TX_POWER_LEVEL => {
                 if let Some(&b) = value.first() {
-                    out.tx_power = Some(b as i8);
+                    self.tx_power = Some(b as i8);
                 }
             }
             _ => {} // ignore other AD types
         }
-
-        i += len + 1;
+        self
     }
-
-    out
 }
 
 /// Parse the parameters of an `LE Advertising Report` sub-event (everything
@@ -778,6 +786,75 @@ mod tests {
         let data = [0x00, 0x09, b'X'];
         let ad = parse_ad_structures(&data);
         assert!(ad.local_name.is_none());
+    }
+
+    #[test]
+    fn ad_structures_yields_type_and_value_pairs() {
+        // [len=2][type=0x0A][0xf8] then [len=3][type=0x09]['F','S'].
+        let data = [
+            0x02,
+            AD_TX_POWER_LEVEL,
+            0xf8,
+            0x03,
+            AD_COMPLETE_LOCAL_NAME,
+            b'F',
+            b'S',
+        ];
+        let structures: Vec<(u8, &[u8])> = ad_structures(&data).collect();
+        let expected: Vec<(u8, &[u8])> = vec![
+            (AD_TX_POWER_LEVEL, &[0xf8]),
+            (AD_COMPLETE_LOCAL_NAME, b"FS"),
+        ];
+        assert_eq!(structures, expected);
+    }
+
+    #[test]
+    fn ad_structures_stops_at_zero_length() {
+        // A zero length byte ends the list; the well-formed structure after it
+        // is padding, not data.
+        let data = [
+            0x02,
+            AD_TX_POWER_LEVEL,
+            0xf8,
+            0x00,
+            0x02,
+            AD_COMPLETE_LOCAL_NAME,
+            b'X',
+        ];
+        let structures: Vec<(u8, &[u8])> = ad_structures(&data).collect();
+        let expected: Vec<(u8, &[u8])> = vec![(AD_TX_POWER_LEVEL, &[0xf8])];
+        assert_eq!(structures, expected);
+    }
+
+    #[test]
+    fn ad_structures_stops_at_a_truncated_structure() {
+        // The second structure claims 8 bytes of name but only 2 remain.
+        let data = [
+            0x02,
+            AD_TX_POWER_LEVEL,
+            0xf8,
+            0x09,
+            AD_COMPLETE_LOCAL_NAME,
+            b'F',
+            b'S',
+        ];
+        let structures: Vec<(u8, &[u8])> = ad_structures(&data).collect();
+        let expected: Vec<(u8, &[u8])> = vec![(AD_TX_POWER_LEVEL, &[0xf8])];
+        assert_eq!(structures, expected);
+    }
+
+    #[test]
+    fn ad_structures_yields_an_empty_value_for_a_type_only_structure() {
+        // `len` counts the type byte, so a length of 1 is a type with no value.
+        let data = [0x01, AD_COMPLETE_LOCAL_NAME];
+        let structures: Vec<(u8, &[u8])> = ad_structures(&data).collect();
+        let expected: Vec<(u8, &[u8])> = vec![(AD_COMPLETE_LOCAL_NAME, &[])];
+        assert_eq!(structures, expected);
+    }
+
+    #[test]
+    fn ad_structures_on_empty_input_yields_nothing() {
+        assert_eq!(ad_structures(&[]).count(), 0);
     }
 
     #[test]
