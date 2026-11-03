@@ -18,6 +18,14 @@ rustle began life as the in-house BLE stack of
 that could be audited end to end. It is now maintained here as a standalone
 library.
 
+## Documentation
+
+- [INSTALL.md](INSTALL.md): toolchain, adding the crate to a project,
+  socket permissions and freeing the adapter from `bluetoothd`.
+- [USAGE.md](USAGE.md): a walk through scanning, filtering, connecting,
+  GATT reads and writes, notifications and testing without a radio.
+- API reference: `cargo doc --open`.
+
 ## What's in the box
 
 | Module | Pure (any OS) | Linux socket layer |
@@ -81,40 +89,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`ScanParams::default()` is **passive**: `scan_type = 0x00`, so the controller
-only listens. An **active** scan (`ScanParams::new(ScanType::Active, …)`)
-makes the controller answer scannable advertisements with a `SCAN_REQ`, which
-carries the controller's own address — `OwnAddrType` chooses the public
-hardware address or a random address you have programmed beforehand. Run an
-active scan's reports through a `scan_merge::ScanMerger` so each device's
-primary advertisement and its `SCAN_RSP` are seen as one.
-
-`HciScanner::start` prefers the Bluetooth 5 extended scan commands (so
-extended-advertising PDUs are reported too) and falls back to the legacy
-commands on a controller that rejects them; the returned `ScanStart` says
-which took and why. Dropping the scanner stops the scan and closes the socket.
+`ScanParams::default()` is a passive scan: the controller only listens.
+`HciScanner::start` prefers the Bluetooth 5 extended scan commands and
+falls back to the legacy ones on a controller that rejects them. Dropping
+the scanner stops the scan and closes the socket. [USAGE.md](USAGE.md)
+covers active scans, scan response merging and filtering.
 
 ## GATT
 
-```rust,no_run
-use rustle::client::GattClient;
-use rustle::l2cap::{L2capAtt, SecurityLevel};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let link = L2capAtt::connect(None, false, "AA:BB:CC:DD:EE:FF", true, SecurityLevel::Low, 5)?;
-    let mut client = GattClient::new(link);
-    client.exchange_mtu(247)?;
-    for service in client.discover_all()? {
-        println!("{} ({} characteristics)",
-            service.service.uuid, service.characteristics.len());
-    }
-    Ok(())
-}
-```
-
-`GattClient` is generic over the `AttIo` trait (one `send`/`recv` per ATT
-PDU), so any framed transport works — the Linux `L2capAtt`, a mock, or your
-own.
+`l2cap::L2capAtt` opens an ATT channel to a peer, and `client::GattClient`
+drives MTU exchange, discovery, reads, writes and notifications over it.
+The client is generic over the `AttIo` trait, so a mock transport serves
+for tests. [USAGE.md](USAGE.md) has the full walk, from connect to
+notification loop.
 
 ## Fuzzing
 
