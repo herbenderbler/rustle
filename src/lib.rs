@@ -26,7 +26,7 @@
 //! | [`gatt`] | GATT declarations, properties, CCCD values | — |
 //! | [`client`] | [`client::GattClient`], generic over an [`client::AttIo`] transport | — |
 //! | [`l2cap`] | address helpers, [`l2cap::SecurityLevel`] | [`l2cap::L2capAtt`]: a connected L2CAP ATT channel |
-//! | [`conn`] | Read RSSI and connection-info codecs | [`conn::read_rssi`]: RSSI of an established LE connection |
+//! | [`conn`] | Read RSSI and connection-list codecs | [`conn::read_rssi`] and [`conn::connections`]: RSSI of an established LE connection, and the connections an adapter carries |
 //!
 //! # Scanning
 //!

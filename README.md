@@ -41,7 +41,7 @@ library.
 | `gatt` | GATT declarations, characteristic properties, CCCD values | — |
 | `client` | `GattClient`, generic over an `AttIo` transport (MTU exchange, discovery, read / read-long / write with and without response, notifications) | — |
 | `l2cap` | address helpers, `SecurityLevel` | `L2capAtt`: a connected L2CAP ATT channel implementing `AttIo` |
-| `conn` | Read RSSI and connection-info codecs | `read_rssi()`: RSSI of an established LE connection via `HCIGETCONNINFO` + HCI Read RSSI |
+| `conn` | Read RSSI and connection-list codecs | `read_rssi()` and `connections()`: RSSI of an established LE connection, and the connections an adapter currently carries |
 
 Every module keeps its pure layer separate from its socket layer, so the
 protocol logic is unit-tested on any OS without a radio, and the `GattClient`
