@@ -4,12 +4,15 @@
 //! such as one opened by [`crate::l2cap::L2capAtt`]. The kernel owns the
 //! connection; this module only looks up its handle (`HCIGETCONNINFO`) and
 //! asks the controller (HCI Read RSSI) over a raw HCI socket of its own.
+//! [`connections`] lists the links an adapter currently carries
+//! (`HCIGETCONNLIST`), answered from kernel state without touching them.
 //!
 //! Split like the rest of the crate: the request and response codecs are pure
 //! and unit-tested on every OS, while the socket layer is Linux-only and needs
 //! `CAP_NET_RAW` (or root). On other platforms [`read_rssi`] returns
-//! [`RssiError::Unsupported`].
+//! [`RssiError::Unsupported`] and [`connections`] fails with an error string.
 
+use crate::hci::format_addr_le;
 use std::fmt;
 use std::io;
 use std::time::Duration;
@@ -53,6 +56,68 @@ pub fn conn_info_request(peer_le: [u8; 6]) -> Vec<u8> {
 pub fn parse_conn_info_handle(buf: &[u8]) -> Option<u16> {
     let b = buf.get(CONN_INFO_HANDLE..CONN_INFO_HANDLE + 2)?;
     Some(u16::from_le_bytes([b[0], b[1]]))
+}
+
+// ---------------------------------------------------------------------------
+// `HCIGETCONNLIST` buffer codec (BlueZ ABI). The ioctl takes one buffer that
+// is `struct hci_conn_list_req` (dev_id(2) + conn_num(2)) going in, followed
+// by `conn_num` capacity slots of `struct hci_conn_info`; the kernel rewrites
+// `conn_num` to the number of entries it filled.
+// ---------------------------------------------------------------------------
+
+/// Size of the list header (`dev_id` + `conn_num`).
+const CONN_LIST_HDR: usize = 4;
+/// Size of one `hci_conn_info` entry: handle(2), bdaddr(6), type(1), out(1),
+/// state(2), link_mode(4).
+const CONN_INFO_LEN: usize = 16;
+/// Entry slots in the request buffer. The kernel's concurrent connection
+/// count stays well below this.
+const CONN_LIST_MAX: usize = 32;
+
+/// One established connection, as the kernel reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnInfo {
+    /// The connection handle that commands like Read RSSI take.
+    pub handle: u16,
+    /// Peer address in display form.
+    pub address: String,
+    /// True for an LE link, false for a BR/EDR link.
+    pub le: bool,
+    /// True when the local side initiated the connection.
+    pub outgoing: bool,
+}
+
+/// Build the `HCIGETCONNLIST` buffer asking for adapter `dev`'s connections.
+pub fn conn_list_request(dev: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; CONN_LIST_HDR + CONN_LIST_MAX * CONN_INFO_LEN];
+    buf[0..2].copy_from_slice(&dev.to_le_bytes());
+    buf[2..4].copy_from_slice(&(CONN_LIST_MAX as u16).to_le_bytes());
+    buf
+}
+
+/// Decode a filled `HCIGETCONNLIST` buffer. The kernel rewrote the count in
+/// the header; a count past the buffer's end, or a truncated trailing entry,
+/// stops the decode rather than reading out of bounds.
+pub fn parse_conn_list(buf: &[u8]) -> Vec<ConnInfo> {
+    let count = match buf.get(2..4) {
+        Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for i in 0..count {
+        let off = CONN_LIST_HDR + i * CONN_INFO_LEN;
+        let entry = match buf.get(off..off + CONN_INFO_LEN) {
+            Some(e) => e,
+            None => break,
+        };
+        out.push(ConnInfo {
+            handle: u16::from_le_bytes([entry[0], entry[1]]),
+            address: format_addr_le(&entry[2..8]),
+            le: entry[8] == LE_LINK,
+            outgoing: entry[9] != 0,
+        });
+    }
+    out
 }
 
 /// A decoded Read RSSI Command Complete event.
@@ -164,10 +229,17 @@ impl std::error::Error for RssiError {
 // ===========================================================================
 
 #[cfg(target_os = "linux")]
-pub use linux_impl::read_rssi;
+pub use linux_impl::{connections, read_rssi};
 
 /// Read the RSSI of an established LE connection. This platform has no raw
 /// HCI socket, so this always fails with [`RssiError::Unsupported`].
+/// List the connections established on an adapter. This platform has no HCI
+/// ioctl interface, so this always fails.
+#[cfg(not(target_os = "linux"))]
+pub fn connections(_dev: u16) -> Result<Vec<ConnInfo>, String> {
+    Err("connection listing is only supported on Linux".to_string())
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn read_rssi(_dev: u16, _peer: &str, _recv_timeout: Duration) -> Result<Option<i8>, RssiError> {
     Err(RssiError::Unsupported)
@@ -195,6 +267,8 @@ mod linux_impl {
     /// shared by x86 / arm / arm64 / riscv (see [`crate::adapter`] for the
     /// field breakdown of sibling requests 210 and 211).
     const HCIGETCONNINFO: c_ulong = 0x8004_48D5;
+    /// Its list-everything sibling, `_IOR('H', 212, int)`.
+    const HCIGETCONNLIST: c_ulong = 0x8004_48D4;
 
     #[repr(C)]
     struct SockaddrHci {
@@ -211,6 +285,29 @@ mod linux_impl {
         // Explicit trailing pad, as in the scanner's copy: the two padding
         // bytes handed to setsockopt stay initialized.
         _pad: u16,
+    }
+
+    /// List the connections currently established on adapter `dev` via
+    /// `HCIGETCONNLIST`. The kernel answers from its own state: no HCI
+    /// command is sent and the connections themselves are untouched.
+    pub fn connections(dev: u16) -> Result<Vec<ConnInfo>, String> {
+        let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
+        if fd < 0 {
+            return Err(format!(
+                "cannot open HCI control socket (errno {}); need CAP_NET_RAW / root",
+                unsafe { errno() }
+            ));
+        }
+        let _guard = FdGuard(fd);
+        let mut buf = conn_list_request(dev);
+        let rc = unsafe { ioctl(fd, HCIGETCONNLIST, buf.as_mut_ptr() as *mut c_void) };
+        if rc < 0 {
+            return Err(format!(
+                "HCIGETCONNLIST failed for hci{dev} (errno {})",
+                unsafe { errno() }
+            ));
+        }
+        Ok(parse_conn_list(&buf))
     }
 
     /// Read the RSSI of the established LE connection to `peer` (a display
@@ -344,6 +441,74 @@ mod linux_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conn_list_request_names_the_adapter_and_capacity() {
+        let buf = conn_list_request(1);
+        assert_eq!(buf.len(), 4 + 32 * 16);
+        assert_eq!(&buf[0..2], &[0x01, 0x00]); // dev_id 1, little-endian
+        assert_eq!(&buf[2..4], &[32, 0x00]); // capacity in slots
+        assert!(buf[4..].iter().all(|&b| b == 0)); // kernel-filled area
+    }
+
+    /// One 16-byte `hci_conn_info` entry.
+    fn conn_entry(handle: u16, addr_le: [u8; 6], link_type: u8, out: u8) -> Vec<u8> {
+        let mut e = Vec::with_capacity(16);
+        e.extend_from_slice(&handle.to_le_bytes());
+        e.extend_from_slice(&addr_le);
+        e.push(link_type);
+        e.push(out);
+        e.extend_from_slice(&[0; 6]); // state(2) + link_mode(4)
+        e
+    }
+
+    #[test]
+    fn conn_list_decodes_entries_and_link_types() {
+        let mut buf = vec![0x00, 0x00, 0x02, 0x00]; // dev 0, count 2
+        buf.extend(conn_entry(
+            0x0040,
+            [0xCC, 0xBB, 0xAA, 0x4E, 0xC9, 0x70],
+            0x80, // LE link
+            1,    // outgoing
+        ));
+        buf.extend(conn_entry(
+            0x0002,
+            [0x06, 0x05, 0x04, 0x03, 0x02, 0x01],
+            0x01, // ACL (BR/EDR)
+            0,    // incoming
+        ));
+        let conns = parse_conn_list(&buf);
+        assert_eq!(
+            conns,
+            vec![
+                ConnInfo {
+                    handle: 0x0040,
+                    address: "70:C9:4E:AA:BB:CC".to_string(),
+                    le: true,
+                    outgoing: true,
+                },
+                ConnInfo {
+                    handle: 0x0002,
+                    address: "01:02:03:04:05:06".to_string(),
+                    le: false,
+                    outgoing: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn conn_list_stops_at_a_truncated_entry() {
+        // The header claims three entries but the buffer holds one full entry
+        // and a truncated second; only the full one is decoded.
+        let mut buf = vec![0x00, 0x00, 0x03, 0x00];
+        buf.extend(conn_entry(0x0040, [0; 6], 0x80, 0));
+        buf.extend_from_slice(&[0xAA; 5]);
+        assert_eq!(parse_conn_list(&buf).len(), 1);
+        // A buffer too short for the header decodes to nothing.
+        assert!(parse_conn_list(&[0x00]).is_empty());
+        assert!(parse_conn_list(&[]).is_empty());
+    }
 
     #[test]
     fn conn_info_request_sets_address_and_le_link() {

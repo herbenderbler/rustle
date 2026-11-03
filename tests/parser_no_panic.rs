@@ -48,6 +48,7 @@ fn feed_all(buf: &[u8]) {
     let _ = att::parse(buf);
     let _ = conn::parse_read_rssi_complete(buf);
     let _ = conn::parse_conn_info_handle(buf);
+    let _ = conn::parse_conn_list(buf);
 }
 
 /// Valid-ish frames worth mutating around, so the fuzzer spends time near the
