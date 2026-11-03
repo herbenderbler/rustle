@@ -98,6 +98,8 @@ pub mod scan_merge;
 #[cfg(target_os = "linux")]
 mod sys;
 
+mod hci_io;
+
 // Compile the code blocks in USAGE.md under `cargo test`, so the guide
 // cannot drift from the API.
 #[cfg(doctest)]

@@ -6,6 +6,8 @@
 //! dependency-free. Private to the crate; each socket module keeps only its own
 //! protocol-specific constants and sockaddr layouts.
 
+use crate::hci_io::HciIo;
+use std::io;
 use std::os::raw::{c_int, c_long, c_ulong, c_void};
 use std::time::Duration;
 
@@ -109,11 +111,44 @@ pub(crate) fn set_recv_timeout(fd: c_int, tv: &Timeval) -> c_int {
     }
 }
 
-/// Closes an fd on early return unless disarmed with `mem::forget`.
+/// An owned file descriptor, closed on drop. During setup it guards against a
+/// leak on early return: disarm it with `mem::forget` when a raw holder takes
+/// the fd over, or move it into its owner. It is also the crate's raw HCI
+/// transport, so a driver can own the socket it talks to.
 pub(crate) struct FdGuard(pub c_int);
 
 impl Drop for FdGuard {
     fn drop(&mut self) {
         unsafe { close(self.0) };
+    }
+}
+
+impl HciIo for FdGuard {
+    fn write_packet(&mut self, pkt: &[u8]) -> io::Result<()> {
+        let n = unsafe { write(self.0, pkt.as_ptr() as *const c_void, pkt.len()) };
+        if n == pkt.len() as isize {
+            Ok(())
+        } else if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short write to HCI socket",
+            ))
+        }
+    }
+
+    fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = unsafe { read(self.0, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        if n > 0 {
+            Ok(n as usize)
+        } else if n == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "controller closed the HCI socket",
+            ))
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 }
