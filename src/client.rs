@@ -12,6 +12,7 @@
 
 use crate::att::{self, AttPdu};
 use crate::gatt::{self, Characteristic, Descriptor, Service};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 
@@ -101,10 +102,56 @@ pub struct GattClient<T: AttIo> {
     io: T,
     mtu: u16,
     /// Notifications/indications received while awaiting a request's response,
-    /// in arrival order, for the caller to drain with [`take_notifications`].
+    /// in arrival order, for the caller to drain with [`take_notifications`] or
+    /// one at a time with [`next_event`].
     ///
     /// [`take_notifications`]: GattClient::take_notifications
-    pending: Vec<(u16, Vec<u8>)>,
+    /// [`next_event`]: GattClient::next_event
+    pending: VecDeque<(u16, Vec<u8>)>,
+}
+
+/// Split off a server-initiated value as `(handle, value, needs_confirmation)`,
+/// or hand the PDU back when it is a response.
+fn as_event(pdu: AttPdu) -> Result<(u16, Vec<u8>, bool), AttPdu> {
+    match pdu {
+        AttPdu::HandleValueNotification { handle, value } => Ok((handle, value, false)),
+        AttPdu::HandleValueIndication { handle, value } => Ok((handle, value, true)),
+        other => Err(other),
+    }
+}
+
+/// Decide whether a non-event PDU answers the outstanding request: an Error
+/// Response naming our request opcode, or the response opcode we want. Anything
+/// else is a protocol error.
+fn settle(pdu: AttPdu, opcode: u8, req_opcode: u8, want_opcode: u8) -> Result<AttPdu, GattError> {
+    match pdu {
+        AttPdu::ErrorResponse { req_opcode: ro, .. } if ro == req_opcode => Ok(pdu),
+        _ if opcode == want_opcode => Ok(pdu),
+        _ => Err(GattError::Protocol(format!(
+            "unexpected 0x{opcode:02x} while awaiting response to 0x{req_opcode:02x}"
+        ))),
+    }
+}
+
+/// The next start handle of a discovery sweep, or `None` when the sweep is
+/// over. `last` is the highest handle the latest batch reported. The walk
+/// continues only when that handle lies inside `start..end`, so the start
+/// handle strictly increases on every step and a peer that repeats or rewinds
+/// handles cannot pin the loop.
+fn advance(start: u16, last: Option<u16>, end: u16) -> Option<u16> {
+    match last {
+        // `h < end <= 0xFFFF`, so `h + 1` cannot overflow.
+        Some(h) if h >= start && h < end => Some(h + 1),
+        _ => None,
+    }
+}
+
+/// What one step of a discovery sweep produced.
+enum Step<R> {
+    /// A batch of records and the highest handle the server reported in it.
+    Batch { items: Vec<R>, last: Option<u16> },
+    /// Attribute Not Found: the server has nothing more in the range.
+    Done,
 }
 
 impl<T: AttIo> GattClient<T> {
@@ -114,7 +161,7 @@ impl<T: AttIo> GattClient<T> {
         Self {
             io,
             mtu: DEFAULT_ATT_MTU,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }
     }
 
@@ -139,37 +186,39 @@ impl<T: AttIo> GattClient<T> {
                 .ok_or_else(|| GattError::Protocol("empty response PDU".into()))?;
             let pdu = att::parse(&raw)
                 .ok_or_else(|| GattError::Protocol(format!("undecodable PDU 0x{opcode:02x}")))?;
-            // A hostile peripheral could stream notifications/indications
-            // forever instead of answering, pinning this loop and growing
-            // `pending` without bound. Cap the queue so such a peer errors the
-            // request out rather than exhausting memory / never returning.
-            match pdu {
-                AttPdu::HandleValueNotification { handle, value } => {
-                    if self.pending.len() >= MAX_PENDING_VALUES {
-                        return Err(GattError::Protocol(
-                            "too many queued notifications while awaiting response".into(),
-                        ));
+            match as_event(pdu) {
+                Ok((handle, value, needs_confirmation)) => {
+                    self.queue_event(handle, value)?;
+                    if needs_confirmation {
+                        self.confirm()?;
                     }
-                    self.pending.push((handle, value))
                 }
-                AttPdu::HandleValueIndication { handle, value } => {
-                    if self.pending.len() >= MAX_PENDING_VALUES {
-                        return Err(GattError::Protocol(
-                            "too many queued indications while awaiting response".into(),
-                        ));
-                    }
-                    self.pending.push((handle, value));
-                    self.io.send(&att::handle_value_confirmation())?;
-                }
-                AttPdu::ErrorResponse { req_opcode: ro, .. } if ro == req_opcode => return Ok(pdu),
-                _ if opcode == want_opcode => return Ok(pdu),
-                _ => {
-                    return Err(GattError::Protocol(format!(
-                        "unexpected 0x{opcode:02x} while awaiting response to 0x{req_opcode:02x}"
-                    )))
-                }
+                Err(pdu) => return settle(pdu, opcode, req_opcode, want_opcode),
             }
         }
+    }
+
+    /// Queue a notification/indication that arrived while a request was
+    /// outstanding, for [`take_notifications`](Self::take_notifications) or
+    /// [`next_event`](Self::next_event) to hand out later.
+    fn queue_event(&mut self, handle: u16, value: Vec<u8>) -> Result<(), GattError> {
+        // A hostile peripheral could stream notifications/indications forever
+        // instead of answering, pinning `request` and growing `pending` without
+        // bound. Cap the queue so such a peer errors the request out rather
+        // than exhausting memory / never returning.
+        if self.pending.len() >= MAX_PENDING_VALUES {
+            return Err(GattError::Protocol(
+                "too many queued values while awaiting response".into(),
+            ));
+        }
+        self.pending.push_back((handle, value));
+        Ok(())
+    }
+
+    /// Send the Handle Value Confirmation that every indication requires.
+    fn confirm(&mut self) -> Result<(), GattError> {
+        self.io.send(&att::handle_value_confirmation())?;
+        Ok(())
     }
 
     /// Turn an `ErrorResponse` into a [`GattError::Att`].
@@ -206,108 +255,100 @@ impl<T: AttIo> GattClient<T> {
         }
     }
 
-    /// Discover all primary services (Read By Group Type over 0x2800, walking the
-    /// whole handle range until the server reports Attribute Not Found).
-    pub fn discover_services(&mut self) -> Result<Vec<Service>, GattError> {
+    /// Walk `start..=end` with one request per step, collecting what each batch
+    /// yields, until the server reports Attribute Not Found, the range is used
+    /// up, or the peer stops advancing (see `advance`).
+    fn sweep<R>(
+        &mut self,
+        start: u16,
+        end: u16,
+        mut step: impl FnMut(&mut Self, u16) -> Result<Step<R>, GattError>,
+    ) -> Result<Vec<R>, GattError> {
         let mut out = Vec::new();
-        let mut start = 0x0001u16;
-        loop {
-            let req = att::read_by_group_type_req(start, 0xFFFF, gatt::PRIMARY_SERVICE_UUID)
-                .ok_or_else(|| GattError::Protocol("bad Primary Service UUID".into()))?;
-            match self.request(&req, att::OP_READ_BY_GROUP_TYPE_RSP)? {
-                AttPdu::ReadByGroupTypeResponse { entries } => {
-                    let batch = gatt::parse_services(&entries);
-                    let last_end = batch.iter().map(|s| s.end_handle).max();
-                    out.extend(batch);
-                    match last_end {
-                        // Require strict forward progress. The group handles are
-                        // taken verbatim from the peer, so a hostile server that
-                        // keeps returning a batch whose max end-handle is <=
-                        // `start` would otherwise pin the loop forever (and grow
-                        // `out` without bound). `end >= start` guarantees `start`
-                        // strictly increases, so the walk always terminates.
-                        Some(end) if end >= start && end < 0xFFFF => start = end + 1,
-                        _ => break, // top of the range, empty batch, or no progress
-                    }
+        let mut cur = Some(start);
+        while let Some(s) = cur.filter(|&s| s <= end) {
+            match step(self, s)? {
+                Step::Batch { items, last } => {
+                    out.extend(items);
+                    cur = advance(s, last, end);
                 }
-                AttPdu::ErrorResponse { error, .. } if error == att::ERR_ATTRIBUTE_NOT_FOUND => {
-                    break
-                }
-                other => return Err(Self::att_err(other, "service discovery")),
+                Step::Done => break,
             }
         }
         Ok(out)
     }
 
+    /// Discover all primary services (Read By Group Type over 0x2800, walking the
+    /// whole handle range until the server reports Attribute Not Found). The
+    /// walk also ends if the peer stops advancing its handles (see `advance`).
+    pub fn discover_services(&mut self) -> Result<Vec<Service>, GattError> {
+        self.sweep(0x0001, 0xFFFF, |c, start| {
+            let req = att::read_by_group_type_req(start, 0xFFFF, gatt::PRIMARY_SERVICE_UUID)
+                .ok_or_else(|| GattError::Protocol("bad Primary Service UUID".into()))?;
+            match c.request(&req, att::OP_READ_BY_GROUP_TYPE_RSP)? {
+                AttPdu::ReadByGroupTypeResponse { entries } => {
+                    let items = gatt::parse_services(&entries);
+                    let last = items.iter().map(|s| s.end_handle).max();
+                    Ok(Step::Batch { items, last })
+                }
+                AttPdu::ErrorResponse { error, .. } if error == att::ERR_ATTRIBUTE_NOT_FOUND => {
+                    Ok(Step::Done)
+                }
+                other => Err(Self::att_err(other, "service discovery")),
+            }
+        })
+    }
+
     /// Discover the characteristics within a service (Read By Type over 0x2803).
+    /// The walk ends early if the peer stops advancing its handles (see `advance`).
     pub fn discover_characteristics(
         &mut self,
         service: &Service,
     ) -> Result<Vec<Characteristic>, GattError> {
-        let mut out = Vec::new();
-        let mut start = service.start_handle;
-        loop {
-            if start > service.end_handle {
-                break;
-            }
+        self.sweep(service.start_handle, service.end_handle, |c, start| {
             let req = att::read_by_type_req(start, service.end_handle, gatt::CHARACTERISTIC_UUID)
                 .ok_or_else(|| GattError::Protocol("bad Characteristic UUID".into()))?;
-            match self.request(&req, att::OP_READ_BY_TYPE_RSP)? {
+            match c.request(&req, att::OP_READ_BY_TYPE_RSP)? {
                 AttPdu::ReadByTypeResponse { entries } => {
-                    let batch = gatt::parse_characteristics(&entries);
-                    let last = batch.iter().map(|c| c.decl_handle).max();
-                    out.extend(batch);
-                    match last {
-                        // Forward-progress guard (see `discover_services`): a peer
-                        // that never advances the max declaration handle can't
-                        // pin this loop.
-                        Some(h) if h >= start && h < service.end_handle => start = h + 1,
-                        _ => break,
-                    }
+                    let items = gatt::parse_characteristics(&entries);
+                    let last = items.iter().map(|ch| ch.decl_handle).max();
+                    Ok(Step::Batch { items, last })
                 }
                 AttPdu::ErrorResponse { error, .. } if error == att::ERR_ATTRIBUTE_NOT_FOUND => {
-                    break
+                    Ok(Step::Done)
                 }
-                other => return Err(Self::att_err(other, "characteristic discovery")),
+                other => Err(Self::att_err(other, "characteristic discovery")),
             }
-        }
-        Ok(out)
+        })
     }
 
     /// Discover the descriptors in a handle range (Find Information). The range
     /// is a characteristic's value handle + 1 up to the handle before the next
-    /// characteristic declaration (or the service's end handle).
+    /// characteristic declaration (or the service's end handle). The walk ends
+    /// early if the peer stops advancing its handles (see `advance`).
     pub fn discover_descriptors(
         &mut self,
         start: u16,
         end: u16,
     ) -> Result<Vec<Descriptor>, GattError> {
-        let mut out = Vec::new();
-        let mut cur = start;
-        loop {
-            if cur > end {
-                break;
-            }
-            match self.request(
+        self.sweep(start, end, |c, cur| {
+            match c.request(
                 &att::find_information_req(cur, end),
                 att::OP_FIND_INFORMATION_RSP,
             )? {
                 AttPdu::FindInformationResponse { entries } => {
                     let last = entries.iter().map(|(h, _)| *h).max();
-                    out.extend(gatt::parse_descriptors(&entries));
-                    match last {
-                        // Forward-progress guard (see `discover_services`).
-                        Some(h) if h >= cur && h < end => cur = h + 1,
-                        _ => break,
-                    }
+                    Ok(Step::Batch {
+                        items: gatt::parse_descriptors(&entries),
+                        last,
+                    })
                 }
                 AttPdu::ErrorResponse { error, .. } if error == att::ERR_ATTRIBUTE_NOT_FOUND => {
-                    break
+                    Ok(Step::Done)
                 }
-                other => return Err(Self::att_err(other, "descriptor discovery")),
+                other => Err(Self::att_err(other, "descriptor discovery")),
             }
-        }
-        Ok(out)
+        })
     }
 
     /// Read an attribute value by handle (single Read Request — the value is
@@ -404,7 +445,7 @@ impl<T: AttIo> GattClient<T> {
 
     /// Drain notifications/indications collected while awaiting request responses.
     pub fn take_notifications(&mut self) -> Vec<(u16, Vec<u8>)> {
-        std::mem::take(&mut self.pending)
+        std::mem::take(&mut self.pending).into()
     }
 
     /// Block for the next server-initiated event (for a notify stream). Returns
@@ -413,8 +454,8 @@ impl<T: AttIo> GattClient<T> {
     /// receive timeout or a non-event PDU (so the caller can loop and re-check a
     /// shutdown flag).
     pub fn next_event(&mut self) -> Result<Option<(u16, Vec<u8>)>, GattError> {
-        if !self.pending.is_empty() {
-            return Ok(Some(self.pending.remove(0)));
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(Some(event));
         }
         let raw = match self.io.recv() {
             Ok(raw) => raw,
@@ -428,12 +469,15 @@ impl<T: AttIo> GattClient<T> {
             }
             Err(e) => return Err(GattError::Io(e)),
         };
-        match att::parse(&raw) {
-            Some(AttPdu::HandleValueNotification { handle, value }) => Ok(Some((handle, value))),
-            Some(AttPdu::HandleValueIndication { handle, value }) => {
-                self.io.send(&att::handle_value_confirmation())?;
+        match att::parse(&raw).map(as_event) {
+            Some(Ok((handle, value, needs_confirmation))) => {
+                if needs_confirmation {
+                    self.confirm()?;
+                }
                 Ok(Some((handle, value)))
             }
+            // A response with no request outstanding, or an undecodable PDU,
+            // is not an event.
             _ => Ok(None),
         }
     }
@@ -889,5 +933,137 @@ mod tests {
             .sent
             .iter()
             .all(|req| req[0] != att::OP_FIND_INFORMATION_REQ));
+    }
+
+    #[test]
+    fn advance_stops_without_a_batch_or_when_the_peer_rewinds() {
+        // An empty batch reports no handle, and a handle below the start means
+        // the peer rewound. Neither may move the sweep forward.
+        assert_eq!(advance(0x0005, None, 0x000F), None);
+        assert_eq!(advance(0x0005, Some(0x0004), 0x000F), None);
+        assert_eq!(advance(0x0005, Some(0x0001), 0x000F), None);
+    }
+
+    #[test]
+    fn advance_stops_at_or_past_the_end_of_the_range() {
+        assert_eq!(advance(0x0005, Some(0x000F), 0x000F), None);
+        assert_eq!(advance(0x0005, Some(0x0010), 0x000F), None);
+    }
+
+    #[test]
+    fn advance_steps_past_the_last_handle_inside_the_range() {
+        // A batch whose last handle is the current start still counts as
+        // progress: the next start is one past it.
+        assert_eq!(advance(0x0005, Some(0x0005), 0x000F), Some(0x0006));
+        assert_eq!(advance(0x0005, Some(0x0009), 0x000F), Some(0x000A));
+        assert_eq!(advance(0x0005, Some(0x000E), 0x000F), Some(0x000F));
+    }
+
+    #[test]
+    fn advance_reaches_the_top_of_the_handle_space_without_overflow() {
+        // 0xFFFE steps to the final handle; 0xFFFF is the end itself, so the
+        // sweep is over and `h + 1` is never computed.
+        assert_eq!(advance(0x0001, Some(0xFFFE), 0xFFFF), Some(0xFFFF));
+        assert_eq!(advance(0x0001, Some(0xFFFF), 0xFFFF), None);
+    }
+
+    #[test]
+    fn as_event_splits_off_a_notification_without_confirmation() {
+        let pdu = att::parse(&[0x1B, 0x03, 0x00, 0xAA]).unwrap();
+        assert_eq!(as_event(pdu), Ok((0x0003, vec![0xAA], false)));
+    }
+
+    #[test]
+    fn as_event_flags_an_indication_for_confirmation() {
+        let pdu = att::parse(&[0x1D, 0x03, 0x00, 0xCC]).unwrap();
+        assert_eq!(as_event(pdu), Ok((0x0003, vec![0xCC], true)));
+    }
+
+    #[test]
+    fn as_event_hands_back_a_response_untouched() {
+        let pdu = att::parse(&[0x0B, 0xDE, 0xAD]).unwrap();
+        assert_eq!(
+            as_event(pdu),
+            Err(AttPdu::ReadResponse {
+                value: vec![0xDE, 0xAD]
+            })
+        );
+    }
+
+    #[test]
+    fn settle_accepts_an_error_response_naming_our_request() {
+        let pdu = AttPdu::ErrorResponse {
+            req_opcode: att::OP_READ_REQ,
+            handle: 0x0003,
+            error: att::ERR_READ_NOT_PERMITTED,
+        };
+        let settled = settle(
+            pdu.clone(),
+            att::OP_ERROR_RSP,
+            att::OP_READ_REQ,
+            att::OP_READ_RSP,
+        )
+        .unwrap();
+        assert_eq!(settled, pdu);
+    }
+
+    #[test]
+    fn settle_accepts_the_wanted_response_opcode() {
+        let pdu = AttPdu::ReadResponse { value: vec![0xBB] };
+        let settled = settle(
+            pdu.clone(),
+            att::OP_READ_RSP,
+            att::OP_READ_REQ,
+            att::OP_READ_RSP,
+        )
+        .unwrap();
+        assert_eq!(settled, pdu);
+    }
+
+    #[test]
+    fn settle_rejects_any_other_pdu_as_a_protocol_error() {
+        // A Write Response while a Read Request is outstanding.
+        match settle(
+            AttPdu::WriteResponse,
+            att::OP_WRITE_RSP,
+            att::OP_READ_REQ,
+            att::OP_READ_RSP,
+        ) {
+            Err(GattError::Protocol(m)) => {
+                assert_eq!(m, "unexpected 0x13 while awaiting response to 0x0a")
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+        // An Error Response for some other request is not ours either.
+        let foreign = AttPdu::ErrorResponse {
+            req_opcode: att::OP_WRITE_REQ,
+            handle: 0x0004,
+            error: att::ERR_WRITE_NOT_PERMITTED,
+        };
+        assert!(matches!(
+            settle(
+                foreign,
+                att::OP_ERROR_RSP,
+                att::OP_READ_REQ,
+                att::OP_READ_RSP
+            ),
+            Err(GattError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn read_fails_once_too_many_values_queue_before_the_response() {
+        // The peer streams MAX_PENDING_VALUES + 1 notifications before the Read
+        // Response. The queue fills at the cap, the next notification errors the
+        // read out, and the response behind it is never reached: the Read
+        // Request is the only PDU ever sent.
+        let ntf = vec![0x1B, 0x03, 0x00, 0xAA];
+        let mut responses = vec![ntf; MAX_PENDING_VALUES + 1];
+        responses.push(vec![0x0B, 0xBB]);
+        let mut client = GattClient::new(MockIo::new(responses));
+        let err = client.read(0x0005).unwrap_err();
+        assert!(matches!(err, GattError::Protocol(_)));
+        assert_eq!(client.io.sent, vec![vec![0x0A, 0x05, 0x00]]);
+        assert_eq!(client.take_notifications().len(), MAX_PENDING_VALUES);
     }
 }
