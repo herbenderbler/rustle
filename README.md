@@ -13,10 +13,10 @@ directly through a handful of `extern "C"` libc calls. The byte parsers that
 face the radio are fuzzed (`fuzz/`) and never panic on malformed input.
 
 rustle began life as the in-house BLE stack of
-[fflock](https://github.com/herbenderbler/fflock), where it replaced the
-`btleplug` + `tokio` + `libdbus` dependency tree with a receive-only scanner
-that could be audited end to end. It is now maintained here as a standalone
-library.
+[fflock](https://github.com/herbenderbler/fflock), where it replaced an
+external BLE stack, together with its async runtime and D-Bus bindings, with
+a receive-only scanner that could be audited end to end. It is now maintained
+here as a standalone library.
 
 ## Documentation
 
