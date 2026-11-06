@@ -197,6 +197,15 @@ the controller transmits. `OwnAddrType` chooses the address that request
 carries. `Random` needs an address programmed beforehand, which the
 scanner does not do.
 
+An active scan also needs `CAP_NET_ADMIN`. The kernel reads it as the
+start of a device discovery, and until that discovery ends the kernel
+refuses new ones and does not make LE connections on the adapter.
+`start` ends any discovery in progress first, and `stop` ends the one the
+scan started. Without the capability, `start` fails with
+`ScanError::Discovery` before the controller is touched. Call `stop`
+yourself before connecting, so a failure is reported: dropping the
+scanner does the same work but cannot return an error.
+
 A device then shows up twice: once for its advertisement and once for its
 scan response. `ScanMerger` holds the first for a short time and emits the
 pair as one `MergedAdv`. Call `flush_stale` on every pass so a device that
@@ -317,6 +326,13 @@ and `High` ask the kernel to pair and encrypt the link. Without
 `bluetoothd` there is no agent to answer a passkey prompt, so pairing only
 succeeds when the device accepts it without one. Stay on `Low` unless the
 device answers reads or writes with ATT error `0x05` or `0x0F`.
+
+Some devices ask to pair as soon as the link is up, whatever the security
+level. If such a device wants a passkey, nothing can answer it without
+`bluetoothd`: the pairing fails, the device closes the link, and the next
+request fails with `GattError::Io` of kind `PermissionDenied`. A Flipper
+Zero behaves this way. `btmon` shows the device's `SMP: Security Request`
+and a disconnect with reason Authentication Failure.
 
 Dropping the channel closes it. The kernel drops the link once nothing
 else uses it.
@@ -519,10 +535,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `ScanError::Bind`, `RssiError::Bind` | No controller at that index. | Check `adapter::enumerate` or `btmgmt info`. |
 | `ScanError::Write` with `PermissionDenied` | The binary lacks `CAP_NET_RAW`. The kernel refuses the scan commands. | Grant `CAP_NET_RAW` or run as root. |
 | `ScanError::Write` with `NetworkDown` | The controller is down. | Bring it up with `btmgmt power on`. |
+| `ScanError::Discovery`, with `is_permission_denied()` true | An active scan needs `CAP_NET_ADMIN`, to end the discovery the kernel believes it starts. | Grant `CAP_NET_ADMIN` as well, or scan passively. |
+| `ScanError::Discovery` from `stop` | The scan is off, but the kernel's discovery did not end. New discoveries and connections on the adapter stay blocked. | `btmgmt stop-find`, as [INSTALL.md](INSTALL.md) describes. |
 | `ScanError::Rejected { status: 0x0C, .. }` | Command Disallowed. The controller refused the command in its current state, for example because something restarted a scan while rustle was setting one up. | Stop `bluetoothd`, or use an adapter nothing else scans on. |
 | `ScanError::NoResponse`, `RssiError::NoResponse` | The controller did not answer within the wait. | Watch `btmon` and reset the adapter. |
 | `Unsupported` from any socket type | The program is not running on Linux. | Only the pure layer is available there. |
 | `GattError::Io` with `TimedOut` or `WouldBlock` | The receive timeout passed during a request. | The peer is slow or gone. Retry, then reconnect. |
+| `GattError::Io` with `PermissionDenied` | The link closed because pairing failed. The device probably asked to pair and wants a passkey. | Pair through `bluetoothd`, or use a device that pairs without a passkey. |
 | `GattError::Att { error, .. }` | The server refused the request. | `0x02` and `0x03` mean not readable or not writable. `0x05` and `0x0F` want a higher `SecurityLevel`. `0x0A` means no such handle. |
 | `GattError::Protocol` | The response could not be decoded or was not the one expected. | Report it with the PDU bytes. |
 | `RssiError::NoConnection` | No LE connection to that peer on that adapter. | Connect first. |
@@ -530,12 +549,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Troubleshooting
 
-- **`bluetoothd` stops finding devices after a scan.** Starting a scan
-  turned off the scan behind a discovery `bluetoothd` was running, and the
-  discovery never finishes. New ones fail with `Busy`. Stop it with
+- **`btmgmt find` fails with `Busy` after a scan.** A discovery is stuck:
+  a passive scan cut off one `bluetoothd` was running, or an active scan's
+  program was killed before it could stop. Until it ends, `bluetoothd`
+  finds nothing and connections on that adapter time out. Stop it with
   `btmgmt stop-find`, adding `-l` if that reports Invalid Parameters, or
   power the adapter off and on. To avoid it, stop `bluetoothd` first, as
   [INSTALL.md](INSTALL.md) describes.
+- **An active scan fails with `Discovery`.** The binary lacks
+  `CAP_NET_ADMIN`. Grant `cap_net_raw,cap_net_admin+ep`.
 - **`Write` fails with `PermissionDenied`.** The binary lacks
   `CAP_NET_RAW`. The socket opens without it, so the error only shows when
   the scan starts. Run `setcap` again after every rebuild.
@@ -549,7 +571,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **`connect_timeout` times out.** The peer is out of range, not
   connectable, or already connected to another host. Scan first to
   confirm it is visible, and check `peer_random` against the report's
-  `addr_type`.
+  `addr_type`. If `btmgmt find` reports `Busy` on that adapter, a stuck
+  discovery is holding the kernel back; see the first entry.
+- **Requests fail with `PermissionDenied` right after connecting.** The
+  device asked to pair and nothing could answer its passkey; see "Connect
+  to a device".
 - **Unsupported errors.** The program runs on a platform other than Linux.
   Only the pure layer works there.
 - **A read never returns.** The receive timeout is zero. Give `open` or

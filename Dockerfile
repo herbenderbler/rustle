@@ -3,9 +3,10 @@
 # build and run commands.
 #
 # Bluetooth sockets belong to the network namespace, so the container must
-# share the host's with --net=host. NET_RAW opens the raw HCI and L2CAP
-# sockets. NET_ADMIN lets btmgmt power the adapter on. The host's bluetoothd
-# still owns the controller from inside the container, so stop it on the host.
+# share the host's with --net=host. NET_RAW lets the examples send commands
+# to the controller. NET_ADMIN lets btmgmt power the adapter on, and lets an
+# active scan end the device discovery the kernel believes it started. The
+# host's bluetoothd still runs beside the container, so stop it on the host.
 
 ARG UBUNTU_VERSION=26.04
 FROM ubuntu:${UBUNTU_VERSION}

@@ -56,16 +56,22 @@ The tests pass on any OS. Only a Linux build can talk to hardware.
 ## Grant socket permissions
 
 The raw HCI socket and the L2CAP socket need the `CAP_NET_RAW` capability.
-Give it to the binary that uses rustle. A rebuild writes a new file, so run
-the command again after every build.
+An active scan, such as the one `examples/battery.rs` runs to find a device
+by name, also needs `CAP_NET_ADMIN`; "Free the adapter" below explains why.
+Give the capabilities to the binary that uses rustle. A rebuild writes a
+new file, so run the command again after every build.
 
 ```bash
-sudo setcap cap_net_raw+ep target/debug/myapp
+sudo setcap cap_net_raw,cap_net_admin+ep target/debug/myapp
 ```
 
-Running the program as root works too. Without the capability the raw
-socket still opens, but the kernel refuses the scan commands, so the error
-is a `Write` error of kind `PermissionDenied`.
+A program that only scans passively needs just `cap_net_raw`. Running the
+program as root works too.
+
+Without `CAP_NET_RAW` the raw socket still opens, but the kernel refuses
+the scan commands, so the error is a `Write` error of kind
+`PermissionDenied`. Without `CAP_NET_ADMIN`, an active scan fails before it
+starts, with a `Discovery` error that names the capability.
 
 ## Free the adapter
 
@@ -77,8 +83,15 @@ Starting a scan first turns off any scan already running on the
 controller, including one the kernel runs for `bluetoothd`. The kernel
 does not notice. If that scan belonged to a device discovery, the
 discovery never finishes, and the kernel refuses new ones on that adapter
-until the stuck one is stopped. "Recover a stuck discovery" below shows
-how.
+until the stuck one is stopped. An active scan avoids this by ending any
+discovery cleanly before it starts; a passive scan does not.
+
+The kernel also reads each of rustle's active scans as a device discovery
+of its own. Until that discovery ends, the kernel refuses new ones and
+does not make LE connections on the adapter, so rustle ends it when the
+scan stops. That is why active scans need `CAP_NET_ADMIN`. A program
+killed before it could stop its scan leaves the discovery running.
+"Recover a stuck discovery" below shows how to end one by hand.
 
 An idle `bluetoothd` does not get in the way, but stopping it is the only
 way to be sure nothing else scans on the adapter. Stopping it also
@@ -114,9 +127,11 @@ sudo systemctl start bluetooth
 
 ### Recover a stuck discovery
 
-If `bluetoothd` stops finding devices after a rustle scan, and
-`btmgmt find` fails with `Busy`, stop the discovery that rustle's scan
-interrupted:
+If `btmgmt find` fails with `Busy` on an adapter rustle scanned on, a
+discovery is stuck: one a passive scan cut off, or one an active scan
+left behind because its program was killed before it could stop. Until it
+ends, `bluetoothd` finds no devices there and connections on that adapter
+time out. Stop it:
 
 ```bash
 sudo btmgmt --index 0 stop-find
@@ -152,9 +167,10 @@ Each line shows an address, the RSSI and the local name when the device
 sends one. A summary line gives the report count at the end. Pass another
 interface name or another number of seconds as needed.
 
-To go one step further, build `examples/battery.rs` the same way and run
-it with the start of a nearby device's name. It connects to the device
-and reads its battery level. [USAGE.md](USAGE.md) explains each step.
+To go one step further, build `examples/battery.rs` the same way, grant
+it `cap_net_raw,cap_net_admin+ep` for its active scan, and run it with the
+start of a nearby device's name. It connects to the device and reads its
+battery level. [USAGE.md](USAGE.md) explains each step.
 
 ## Test in a container
 
@@ -177,8 +193,9 @@ belong to the network namespace, so it must share the machine's with
 `--net=host`. `NET_RAW` is the capability from "Grant socket permissions"
 above. Docker grants it to every container by default, and the flag keeps
 the command working under runtimes that do not. `NET_ADMIN` lets `btmgmt`
-power the adapter on. The machine's `bluetoothd` still runs beside the
-container, so stop it first, as described above.
+power the adapter on and lets an active scan end the kernel's discovery,
+as "Free the adapter" explains. The machine's `bluetoothd` still runs
+beside the container, so stop it first, as described above.
 
 ```bash
 docker run --rm -it --net=host --cap-add=NET_RAW --cap-add=NET_ADMIN rustle

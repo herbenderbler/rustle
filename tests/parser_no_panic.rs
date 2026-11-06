@@ -12,7 +12,7 @@
 //! `cargo fuzz` targets under `fuzz/` (which need nightly): those
 //! explore deeper, this one gates every PR. See `fuzz/README.md`.
 
-use rustle::{att, conn, hci};
+use rustle::{att, conn, hci, mgmt};
 
 /// Tiny deterministic PRNG (xorshift64*), so any failure reproduces from the
 /// fixed seed rather than being a heisenbug.
@@ -50,6 +50,7 @@ fn feed_all(buf: &[u8]) {
     let _ = conn::parse_read_rssi_complete(buf);
     let _ = conn::parse_conn_info_handle(buf);
     let _ = conn::parse_conn_list(buf);
+    let _ = mgmt::parse_command_reply(buf);
 }
 
 /// Valid-ish frames worth mutating around, so the fuzzer spends time near the
