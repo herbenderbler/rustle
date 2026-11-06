@@ -317,15 +317,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `local_random` | True when the local address is a random address. |
 | `peer` | Address of the device, written as `AA:BB:CC:DD:EE:FF`. |
 | `peer_random` | True when the peer uses a random address. The `addr_type` of its scan report says which. |
-| `security` | Requested link security. `Low` needs no pairing. |
+| `security` | Link security to wait for. `Low` needs no pairing; the higher levels are described below. |
 | `recv_timeout_secs` | Receive timeout in seconds. A notification loop uses it to check a shutdown flag. |
 | `timeout` | Only on `connect_timeout`. Upper bound on the connection attempt. |
 
 `SecurityLevel::Low` needs no pairing and works with most devices. `Medium`
-and `High` ask the kernel to pair and encrypt the link. Without
-`bluetoothd` there is no agent to answer a passkey prompt, so pairing only
-succeeds when the device accepts it without one. Stay on `Low` unless the
-device answers reads or writes with ATT error `0x05` or `0x0F`.
+asks for an encrypted link, and `High` for one whose key is protected
+against man-in-the-middle attacks, for example by a passkey. For either,
+the kernel connects first and pairs afterwards, so `connect` waits until
+the link reaches the level and fails if it does not. The channel's
+`security()` reports the level the link reached.
+
+The kernel asks for every pairing to be approved, even one that needs no
+passkey. Normally `bluetoothd` passes the request to a registered pairing
+agent, such as a desktop's Bluetooth applet, which asks the user. Without
+one, nothing approves it: the pairing stalls, `connect` fails with
+`TimedOut`, and the kernel holds the link until it abandons the pairing
+about 30 seconds later. Stay on `Low` unless the device answers reads or
+writes with ATT error `0x05` or `0x0F`.
 
 Some devices ask to pair as soon as the link is up, whatever the security
 level. If such a device wants a passkey, nothing can answer it without
@@ -546,6 +555,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `GattError::Protocol` | The response could not be decoded or was not the one expected. | Report it with the PDU bytes. |
 | `RssiError::NoConnection` | No LE connection to that peer on that adapter. | Connect first. |
 | `TimedOut` from `connect_timeout` | The peer did not answer in time. | See below. |
+| `TimedOut` from a connect at `Medium` or `High`, saying pairing did not finish | The link came up, but nothing approved the pairing. | Run `bluetoothd` with a pairing agent, or connect at `Low`. |
 
 ## Troubleshooting
 
@@ -573,6 +583,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   confirm it is visible, and check `peer_random` against the report's
   `addr_type`. If `btmgmt find` reports `Busy` on that adapter, a stuck
   discovery is holding the kernel back; see the first entry.
+- **A connect at `Medium` or `High` fails with "pairing did not finish".**
+  The kernel paired as far as asking for approval, and nothing approved.
+  `btmon` shows `SMP: Pairing Random`, then `MGMT Event: User Confirmation
+  Request` with no reply. See "Connect to a device".
 - **Requests fail with `PermissionDenied` right after connecting.** The
   device asked to pair and nothing could answer its passkey; see "Connect
   to a device".

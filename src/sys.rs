@@ -29,6 +29,10 @@ pub(crate) const O_NONBLOCK: c_int = 0o4000;
 
 /// `poll` "writable" event bit (`events` / `revents` are `short`).
 pub(crate) const POLLOUT: i16 = 0x0004;
+/// `poll` error bit. Always reported in `revents`, even when not requested.
+pub(crate) const POLLERR: i16 = 0x0008;
+/// `poll` hang-up bit. Always reported in `revents`, even when not requested.
+pub(crate) const POLLHUP: i16 = 0x0010;
 
 /// `struct pollfd` for `poll`.
 #[repr(C)]

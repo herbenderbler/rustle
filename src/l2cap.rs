@@ -3,17 +3,46 @@
 //! Connects a `SOCK_SEQPACKET` L2CAP socket to a peer on the ATT fixed channel
 //! (CID `0x0004`). The kernel performs the LE link + L2CAP setup, and because
 //! the channel is sequential-packet each `recv` yields exactly one ATT PDU. The
-//! socket layer is Linux-only (needs elevated perms and `bluetoothd` to not own
-//! the controller); on other platforms [`L2capAtt::connect`] fails with
+//! socket layer is Linux-only and needs elevated permissions; on other
+//! platforms [`L2capAtt::connect`] fails with
 //! [`std::io::ErrorKind::Unsupported`]. The pure address helper and
 //! [`SecurityLevel`] exist everywhere.
+//!
+//! # Security
+//!
+//! Above [`SecurityLevel::Low`] the kernel must pair with the device, and it
+//! does so only after it has reported the channel connected. It then asks a
+//! pairing agent to approve the pairing, even a Just Works pairing that needs
+//! no passkey. Without a program to approve it, such as `bluetoothd` with an
+//! agent registered, the pairing never finishes and the link stays
+//! unencrypted. [`L2capAtt::connect`] therefore waits for the link to reach
+//! the requested level and fails if it does not.
 
-/// L2CAP security level requested via `BT_SECURITY` before connecting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Link security for an ATT channel, as the kernel's `BT_SECURITY` levels.
+///
+/// `Low` leaves the link unencrypted. `Medium` needs an encrypted link, and
+/// `High` an encrypted link whose key was authenticated against
+/// man-in-the-middle attacks, for example with a passkey. Both make the kernel
+/// pair with the device. Levels compare in that order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SecurityLevel {
     Low = 1,
     Medium = 2,
     High = 3,
+}
+
+impl SecurityLevel {
+    /// The level a raw `BT_SECURITY` value reports. The kernel's FIPS level
+    /// (4, Secure Connections with an authenticated key) meets `High`, and
+    /// anything below `Low` counts as `Low`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn from_bt_security(raw: u8) -> SecurityLevel {
+        match raw {
+            0..=1 => SecurityLevel::Low,
+            2 => SecurityLevel::Medium,
+            _ => SecurityLevel::High,
+        }
+    }
 }
 
 /// Parse a display MAC (`"AA:BB:CC:DD:EE:FF"`) into the 6 little-endian bytes a
@@ -50,7 +79,8 @@ mod linux_impl {
     use crate::sys::{
         bind, close, connect, errno, fcntl, getsockopt, poll, read, set_recv_timeout, setsockopt,
         socket, write, FdGuard, PollFd, Timeval, AF_BLUETOOTH, BTPROTO_L2CAP, EAGAIN, EINPROGRESS,
-        EINTR, F_GETFL, F_SETFL, O_NONBLOCK, POLLOUT, SOCK_SEQPACKET, SOL_SOCKET, SO_ERROR,
+        EINTR, F_GETFL, F_SETFL, O_NONBLOCK, POLLERR, POLLHUP, POLLOUT, SOCK_SEQPACKET, SOL_SOCKET,
+        SO_ERROR,
     };
     use std::io;
     use std::os::raw::{c_int, c_void};
@@ -58,6 +88,12 @@ mod linux_impl {
 
     const SOL_BLUETOOTH: c_int = 274;
     const BT_SECURITY: c_int = 4;
+
+    /// How long [`L2capAtt::connect`] waits for pairing. The kernel abandons
+    /// a pairing that makes no progress for 30 s, so this outlasts it.
+    const PAIRING_WAIT: Duration = Duration::from_secs(40);
+    /// How often the link's security level is checked while waiting.
+    const SECURITY_POLL: Duration = Duration::from_millis(50);
 
     /// ATT protocol's fixed L2CAP channel identifier.
     const ATT_CID: u16 = 0x0004;
@@ -96,6 +132,120 @@ mod linux_impl {
                 BDADDR_LE_PUBLIC
             },
             _pad: 0,
+        }
+    }
+
+    /// The socket's pending error (`SO_ERROR`), which reading also clears.
+    fn socket_error(fd: c_int) -> io::Result<Option<io::Error>> {
+        let mut err: c_int = 0;
+        let mut len = std::mem::size_of::<c_int>() as u32;
+        let rc = unsafe {
+            getsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_ERROR,
+                &mut err as *mut c_int as *mut c_void,
+                &mut len,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((err != 0).then(|| io::Error::from_raw_os_error(err)))
+    }
+
+    /// Wait up to `ms` for the link to drop. `Ok` means it is still up;
+    /// otherwise the error is the one the kernel recorded for the socket.
+    fn link_up(fd: c_int, ms: c_int) -> io::Result<()> {
+        // With no events requested, poll reports only a hang-up or an error,
+        // so data arriving on the channel does not wake it.
+        let mut pfd = PollFd {
+            fd,
+            events: 0,
+            revents: 0,
+        };
+        let rc = unsafe { poll(&mut pfd, 1, ms) };
+        if rc < 0 {
+            let e = unsafe { errno() };
+            return if e == EINTR {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(e))
+            };
+        }
+        if pfd.revents & (POLLHUP | POLLERR) == 0 {
+            return Ok(());
+        }
+        Err(socket_error(fd)?
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "the link closed")))
+    }
+
+    /// The raw `BT_SECURITY` level. While the link is up it is the link's
+    /// level; once the link is gone the kernel reports the requested level
+    /// instead, so callers check [`link_up`] after reading it.
+    fn bt_security(fd: c_int) -> io::Result<u8> {
+        let mut sec = BtSecurity {
+            level: 0,
+            key_size: 0,
+        };
+        let mut len = std::mem::size_of::<BtSecurity>() as u32;
+        let rc = unsafe {
+            getsockopt(
+                fd,
+                SOL_BLUETOOTH,
+                BT_SECURITY,
+                &mut sec as *mut BtSecurity as *mut c_void,
+                &mut len,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(sec.level)
+    }
+
+    /// Hold a newly connected channel until its link reaches `wanted`.
+    ///
+    /// The kernel reports an ATT channel connected before it pairs, so a
+    /// channel asked to run above `Low` starts out unencrypted. Check the
+    /// link's level until it reaches `wanted`, the link drops, or `deadline`
+    /// passes.
+    fn await_security(
+        fd: c_int,
+        peer: &str,
+        wanted: SecurityLevel,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        if wanted == SecurityLevel::Low {
+            return Ok(());
+        }
+        let begun = Instant::now();
+        let closed = |e: io::Error| {
+            io::Error::new(
+                e.kind(),
+                format!("link to {peer} closed before reaching {wanted:?} security: {e}"),
+            )
+        };
+        loop {
+            let level = SecurityLevel::from_bt_security(bt_security(fd)?);
+            link_up(fd, 0).map_err(closed)?;
+            if level >= wanted {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "link to {peer} still at {level:?} security after {} ms, short of \
+                         {wanted:?}: pairing did not finish. The kernel asks a pairing agent, \
+                         such as bluetoothd's, to approve every pairing",
+                        begun.elapsed().as_millis()
+                    ),
+                ));
+            }
+            let ms = remaining.min(SECURITY_POLL).as_millis() as c_int;
+            link_up(fd, ms).map_err(closed)?;
         }
     }
 
@@ -155,20 +305,23 @@ mod linux_impl {
                 return Err(io::Error::last_os_error());
             }
 
-            // Requested security level (best-effort: some links negotiate it
-            // during connect, so a setsockopt failure here isn't fatal).
+            // Requested security level. Low is the kernel's default, so only a
+            // failure to ask for more matters.
             let sec = BtSecurity {
                 level: security as u8,
                 key_size: 0,
             };
-            unsafe {
+            let rc = unsafe {
                 setsockopt(
                     fd,
                     SOL_BLUETOOTH,
                     BT_SECURITY,
                     &sec as *const BtSecurity as *const c_void,
                     std::mem::size_of::<BtSecurity>() as u32,
-                );
+                )
+            };
+            if rc < 0 && security > SecurityLevel::Low {
+                return Err(io::Error::last_os_error());
             }
 
             // Receive timeout so a notify read loop stays responsive to shutdown.
@@ -184,6 +337,14 @@ mod linux_impl {
         /// shutdown flag. The `connect` itself is blocking (the kernel drives the
         /// LE connection) and runs until the kernel's own connection supervision
         /// gives up; [`connect_timeout`](Self::connect_timeout) bounds it instead.
+        ///
+        /// Above [`SecurityLevel::Low`] it returns only once the link has
+        /// reached `security`, because the kernel connects first and pairs
+        /// afterwards. It fails if the link drops first, or with
+        /// [`io::ErrorKind::TimedOut`] if pairing has not finished within 40 s,
+        /// longer than the kernel's own 30 s pairing timeout. The kernel asks a
+        /// pairing agent to approve every pairing, Just Works included, so
+        /// without one, such as `bluetoothd` with an agent registered, it fails.
         pub fn connect(
             local: Option<&str>,
             local_random: bool,
@@ -213,6 +374,7 @@ mod linux_impl {
             if rc < 0 {
                 return Err(io::Error::last_os_error());
             }
+            await_security(fd, peer, security, Instant::now() + PAIRING_WAIT)?;
 
             std::mem::forget(guard); // success — ownership moves to L2capAtt
             Ok(L2capAtt { fd })
@@ -226,6 +388,11 @@ mod linux_impl {
         /// connect completes immediately. On success the socket returns to
         /// blocking mode, with receives paced by `recv_timeout_secs` exactly
         /// as in [`connect`](Self::connect).
+        ///
+        /// Above [`SecurityLevel::Low`], `timeout` also covers the pairing:
+        /// it fails with [`io::ErrorKind::TimedOut`] if the link has not
+        /// reached `security` by then. Allow more than the kernel's 30 s
+        /// pairing timeout when a person has to approve the pairing.
         pub fn connect_timeout(
             local: Option<&str>,
             local_random: bool,
@@ -244,6 +411,7 @@ mod linux_impl {
                 recv_timeout_secs,
             )?;
             let fd = guard.0;
+            let deadline = Instant::now() + timeout;
 
             // Non-blocking, so connect() returns at once with EINPROGRESS.
             let flags = unsafe { fcntl(fd, F_GETFL) };
@@ -269,9 +437,8 @@ mod linux_impl {
 
                 // Await writability (the connect's completion) within the
                 // deadline, re-polling with the remaining time on EINTR.
-                let begun = Instant::now();
                 loop {
-                    let remaining = timeout.saturating_sub(begun.elapsed());
+                    let remaining = deadline.saturating_duration_since(Instant::now());
                     let ms = remaining.as_millis().min(c_int::MAX as u128) as c_int;
                     let mut pfd = PollFd {
                         fd,
@@ -295,22 +462,8 @@ mod linux_impl {
                 }
 
                 // The socket is writable; SO_ERROR holds the connect's result.
-                let mut err: c_int = 0;
-                let mut len = std::mem::size_of::<c_int>() as u32;
-                let rc = unsafe {
-                    getsockopt(
-                        fd,
-                        SOL_SOCKET,
-                        SO_ERROR,
-                        &mut err as *mut c_int as *mut c_void,
-                        &mut len,
-                    )
-                };
-                if rc < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if err != 0 {
-                    return Err(io::Error::from_raw_os_error(err));
+                if let Some(e) = socket_error(fd)? {
+                    return Err(e);
                 }
             }
 
@@ -318,9 +471,19 @@ mod linux_impl {
             if unsafe { fcntl(fd, F_SETFL, flags) } < 0 {
                 return Err(io::Error::last_os_error());
             }
+            await_security(fd, peer, security, deadline)?;
 
             std::mem::forget(guard); // success — ownership moves to L2capAtt
             Ok(L2capAtt { fd })
+        }
+
+        /// The link's current security level. After a successful connect it
+        /// is at least the level that was requested. Fails once the link is
+        /// gone.
+        pub fn security(&self) -> io::Result<SecurityLevel> {
+            let raw = bt_security(self.fd)?;
+            link_up(self.fd, 0)?;
+            Ok(SecurityLevel::from_bt_security(raw))
         }
     }
 
@@ -416,6 +579,11 @@ mod other_impl {
                 "L2CAP ATT sockets are only supported on Linux",
             ))
         }
+
+        /// Unreachable: no value of this type can exist on this platform.
+        pub fn security(&self) -> io::Result<SecurityLevel> {
+            match self.0 {}
+        }
     }
 
     impl AttIo for L2capAtt {
@@ -461,6 +629,22 @@ mod tests {
         assert_eq!(SecurityLevel::Low as u8, 1);
         assert_eq!(SecurityLevel::Medium as u8, 2);
         assert_eq!(SecurityLevel::High as u8, 3);
+    }
+
+    #[test]
+    fn security_levels_order_from_low_to_high() {
+        assert!(SecurityLevel::Low < SecurityLevel::Medium);
+        assert!(SecurityLevel::Medium < SecurityLevel::High);
+    }
+
+    #[test]
+    fn raw_bt_security_values_map_to_levels() {
+        // 0 is BT_SECURITY_SDP, below Low; 4 is BT_SECURITY_FIPS, above High.
+        assert_eq!(SecurityLevel::from_bt_security(0), SecurityLevel::Low);
+        assert_eq!(SecurityLevel::from_bt_security(1), SecurityLevel::Low);
+        assert_eq!(SecurityLevel::from_bt_security(2), SecurityLevel::Medium);
+        assert_eq!(SecurityLevel::from_bt_security(3), SecurityLevel::High);
+        assert_eq!(SecurityLevel::from_bt_security(4), SecurityLevel::High);
     }
 
     #[cfg(not(target_os = "linux"))]
