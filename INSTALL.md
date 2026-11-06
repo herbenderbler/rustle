@@ -176,9 +176,9 @@ The container needs three things to reach a controller. Bluetooth sockets
 belong to the network namespace, so it must share the machine's with
 `--net=host`. `NET_RAW` is the capability from "Grant socket permissions"
 above. Docker grants it to every container by default, and the flag keeps
-the command working under runtimes that do not. `NET_ADMIN` lets `btmgmt` power the adapter on. The
-machine's `bluetoothd` still runs beside the container, so stop it first,
-as described above.
+the command working under runtimes that do not. `NET_ADMIN` lets `btmgmt`
+power the adapter on. The machine's `bluetoothd` still runs beside the
+container, so stop it first, as described above.
 
 ```bash
 docker run --rm -it --net=host --cap-add=NET_RAW --cap-add=NET_ADMIN rustle
