@@ -1,8 +1,7 @@
-# Coverage-guided fuzzing of the rustle byte parsers (see README.md).
+# cargo-fuzz targets for the rustle byte parsers. See README.md.
 #
-# Detached from the parent workspace (own empty `[workspace]`), so the stable
-# build, CI, cargo-deny, and cargo-machete never see this nightly-only crate —
-# mirrors how firmware/flock-node stays out of the workspace.
+# This crate is its own workspace. The empty `[workspace]` at the end keeps it
+# out of the main build and CI. It needs nightly Rust.
 [package]
 name = "rustle-fuzz"
 version = "0.0.0"

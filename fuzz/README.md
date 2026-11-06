@@ -1,15 +1,14 @@
 # Fuzzing the rustle byte parsers
 
-The BLE stack decodes attacker-controlled advertisement and ATT bytes in **safe
-Rust**, with no C library behind a D-Bus binding in the path. These
-coverage-guided [`cargo fuzz`][cf] targets hunt for any input that
-makes a parser **panic**: a panic on a hostile advertisement or ATT PDU is a
-remote DoS of the scanner / interact client, not just a bug.
+rustle decodes advertisements and ATT PDUs sent by devices it does not
+control. The parsers are safe Rust, but safe code can still panic. The
+[`cargo fuzz`][cf] targets here search for input that makes a parser panic.
+Such a panic is more than a bug. A nearby device could send those bytes on
+purpose and crash any program that scans or connects with rustle.
 
-This crate is **detached from the workspace** (its own empty `[workspace]` in
-`Cargo.toml`), so the stable build, CI, `cargo-deny`, and `cargo-machete` never
-see it — the same way `firmware/flock-node` stays out of the tree. Fuzzing needs
-**nightly** plus `cargo-fuzz`:
+This crate is its own workspace. Its `Cargo.toml` declares an empty
+`[workspace]`, so the main build and CI never build it. Fuzzing needs nightly
+Rust and `cargo-fuzz`:
 
 ```bash
 rustup toolchain install nightly
