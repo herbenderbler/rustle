@@ -7,8 +7,8 @@ Such a panic is more than a bug. A nearby device could send those bytes on
 purpose and crash any program that scans or connects with rustle.
 
 This crate is its own workspace. Its `Cargo.toml` declares an empty
-`[workspace]`, so the main build and CI never build it. Fuzzing needs nightly
-Rust and `cargo-fuzz`:
+`[workspace]`, so the main build never builds it. Fuzzing needs nightly Rust
+and `cargo-fuzz`:
 
 ```bash
 rustup toolchain install nightly
@@ -35,11 +35,22 @@ cargo +nightly fuzz run att_pdu
 A crash writes a reproducer under `artifacts/<target>/`; replay it with
 `cargo +nightly fuzz run <target> artifacts/<target>/<crash>`.
 
-## Always-on complement
+## In CI
 
-`cargo fuzz` needs nightly and isn't a per-PR gate. The stable-toolchain
-`tests/parser_no_panic.rs` integration test feeds these same
-parsers a large deterministic mix of random and seed-mutated bytes on **every**
-CI run, so the no-panic property is regression-gated even without a fuzz job.
+CI does not fuzz. `cargo fuzz` needs nightly, and what a fuzzing run finds
+varies from run to run, so it isn't a per-PR gate. Two checks run on
+**every** CI build instead:
+
+- The Linux job type-checks these targets on stable with
+  `cargo check --manifest-path fuzz/Cargo.toml --locked`. A parser change
+  that breaks a target fails the build. `Cargo.lock` is committed so the
+  check always builds the same `libfuzzer-sys`. Refresh it with
+  `cargo update --manifest-path fuzz/Cargo.toml` to take a newer release,
+  and after a change to rustle's version, which `--locked` rejects until
+  the lock file matches.
+- The stable-toolchain `tests/parser_no_panic.rs` integration test feeds
+  these same parsers a large deterministic mix of random and seed-mutated
+  bytes, so the no-panic property is regression-gated even without a fuzz
+  job.
 
 [cf]: https://rust-fuzz.github.io/book/cargo-fuzz.html
