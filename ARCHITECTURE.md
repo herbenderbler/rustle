@@ -75,7 +75,9 @@ build.
 
 `fuzz/` holds `cargo-fuzz` targets for the HCI, advertising data and ATT
 parsers. It is a separate
-workspace that needs nightly Rust. See [fuzz/README.md](fuzz/README.md).
+workspace that needs nightly Rust. CI does not fuzz, but every CI run
+type-checks the targets on stable, so a parser change that breaks one
+fails CI. See [fuzz/README.md](fuzz/README.md).
 
 CI builds and tests on Linux and macOS. The macOS job proves that the
 stubs for other systems compile and that the pure layer passes its tests

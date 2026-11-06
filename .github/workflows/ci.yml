@@ -32,6 +32,11 @@ jobs:
         run: cargo test --locked
       - name: Docs (broken intra-doc links are errors)
         run: cargo doc --no-deps --locked
+      # The fuzz crate is its own workspace, and fuzzing it needs nightly
+      # cargo-fuzz, but its targets type-check on stable. This catches a
+      # parser API change that would break them. It does not fuzz.
+      - name: Fuzz targets build
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
 
   macos:
     # The socket layers are Linux-only. This proves the non-Linux stubs compile

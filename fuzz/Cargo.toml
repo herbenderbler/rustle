@@ -1,7 +1,8 @@
 # cargo-fuzz targets for the rustle byte parsers. See README.md.
 #
 # This crate is its own workspace. The empty `[workspace]` at the end keeps it
-# out of the main build and CI. It needs nightly Rust.
+# out of the main build. Fuzzing needs nightly Rust. CI only type-checks the
+# targets, on stable, against the committed Cargo.lock.
 [package]
 name = "rustle-fuzz"
 version = "0.0.0"
