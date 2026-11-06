@@ -369,15 +369,14 @@ mod linux_impl {
         cmd: &[u8],
         timeout: Duration,
     ) -> Result<u8, MgmtError> {
+        // Only a negative return is a failed write. When the kernel answers
+        // the command itself, without running it (Permission Denied, Invalid
+        // Index, Invalid Parameters), it queues that status as the reply and
+        // write() returns 0; a command that runs returns its full length.
+        // Either way the reply is read below.
         let n = unsafe { write(fd, cmd.as_ptr() as *const c_void, cmd.len()) };
         if n < 0 {
             return Err(MgmtError::Write(io::Error::last_os_error()));
-        }
-        if n as usize != cmd.len() {
-            return Err(MgmtError::Write(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short write to management socket",
-            )));
         }
 
         let deadline = Instant::now() + timeout;
