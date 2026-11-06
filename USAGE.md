@@ -65,7 +65,7 @@ it.
 `examples/battery.rs` is a complete program that does the four things most
 BLE clients do. It scans until it hears a device whose name starts with a
 prefix, connects to it, discovers its attribute table, and reads the
-standard Battery Level characteristic. Build it, grant the capability and
+standard Battery Level characteristic. Build it, grant the capabilities and
 run it with the start of your device's name:
 
 ```bash
@@ -73,7 +73,7 @@ cargo build --example battery
 ```
 
 ```bash
-sudo setcap cap_net_raw+ep target/debug/examples/battery
+sudo setcap cap_net_raw,cap_net_admin+ep target/debug/examples/battery
 ```
 
 ```bash
