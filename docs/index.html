@@ -56,7 +56,7 @@
   .stage-inner { position: relative; width: 100%; height: min(460px, 70vh); }
   .scene { position: absolute; inset: 0; opacity: 0; transition: opacity 0.45s ease; display: flex; align-items: center; }
   .scene.on { opacity: 1; }
-  .scene svg { width: 100%; height: auto; display: block; }
+  .scene svg { width: 100%; height: auto; display: block; fill: var(--fg); }
   .scene text { font-family: var(--mono); font-size: 13px; }
   .scene text.lg { font-size: 22px; }
   .scene text.sm { font-size: 11px; }
@@ -151,7 +151,7 @@
       <div class="term-bar"><i></i><i></i><i></i><em>scan</em></div>
       <pre class="term-body" id="term"></pre>
     </div>
-    <a class="down" href="#path" aria-label="Start">
+    <a class="down" href="#radio" aria-label="Start">
       <svg viewBox="0 0 18 28" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 2 v20 M3 16 l6 8 6-8"/></svg>
     </a>
   </header>
@@ -159,19 +159,100 @@
   <nav class="rail" id="rail" aria-label="Sections">
     <div class="rail-track"><div class="rail-fill" id="rail-fill"></div></div>
     <ol>
-      <li data-scene="path" tabindex="0"><span class="ry">01</span><span class="rt">the path</span></li>
-      <li data-scene="packet" tabindex="0"><span class="ry">02</span><span class="rt">one event</span></li>
-      <li data-scene="address" tabindex="0"><span class="ry">03</span><span class="rt">the address</span></li>
-      <li data-scene="merge" tabindex="0"><span class="ry">04</span><span class="rt">two reports</span></li>
-      <li data-scene="handles" tabindex="0"><span class="ry">05</span><span class="rt">handles</span></li>
-      <li data-scene="layers" tabindex="0"><span class="ry">06</span><span class="rt">two layers</span></li>
+      <li data-scene="radio" tabindex="0"><span class="ry">01</span><span class="rt">the radio</span></li>
+      <li data-scene="stack" tabindex="0"><span class="ry">02</span><span class="rt">the stack</span></li>
+      <li data-scene="path" tabindex="0"><span class="ry">03</span><span class="rt">the path</span></li>
+      <li data-scene="packet" tabindex="0"><span class="ry">04</span><span class="rt">one event</span></li>
+      <li data-scene="address" tabindex="0"><span class="ry">05</span><span class="rt">the address</span></li>
+      <li data-scene="merge" tabindex="0"><span class="ry">06</span><span class="rt">two reports</span></li>
+      <li data-scene="handles" tabindex="0"><span class="ry">07</span><span class="rt">handles</span></li>
+      <li data-scene="layers" tabindex="0"><span class="ry">08</span><span class="rt">two layers</span></li>
     </ol>
   </nav>
 
   <div id="scrolly">
     <div class="stage">
       <div class="stage-inner">
-        <div class="scene on" data-scene="path">
+        <div class="scene on" data-scene="radio">
+          <svg viewBox="0 0 520 420" role="img">
+            <title>Advertising is a broadcast; a connection is a two-way conversation</title>
+            <text x="24" y="36" fill="#a89c90" font-size="12">advertising · one talks, anyone listens</text>
+            <rect x="24" y="56" width="132" height="80" fill="#1b1714" stroke="#f3efe8" stroke-width="1.5"/>
+            <text x="90" y="92" text-anchor="middle">peripheral</text>
+            <text class="sm" x="90" y="114" text-anchor="middle" fill="#a89c90">a sensor</text>
+            <rect x="364" y="56" width="132" height="80" fill="#1b1714" stroke="#f3efe8" stroke-width="1.5"/>
+            <text x="430" y="92" text-anchor="middle">scanner</text>
+            <text class="sm" x="430" y="114" text-anchor="middle" fill="#a89c90">rustle on hci0</text>
+            <g stroke="#e3844a" stroke-width="1.4" stroke-dasharray="4 4">
+              <line x1="156" y1="72" x2="364" y2="72"/>
+              <line x1="156" y1="96" x2="364" y2="96"/>
+              <line x1="156" y1="120" x2="364" y2="120"/>
+            </g>
+            <g fill="#e3844a">
+              <rect x="236" y="67" width="40" height="10"/>
+              <rect x="236" y="91" width="40" height="10"/>
+              <rect x="236" y="115" width="40" height="10"/>
+            </g>
+            <g class="sm" fill="#a89c90">
+              <text x="168" y="67">ch 37</text>
+              <text x="168" y="91">ch 38</text>
+              <text x="168" y="115">ch 39</text>
+            </g>
+            <text class="sm" x="260" y="160" text-anchor="middle" fill="#e3844a">ADV · up to 31 bytes, no reply needed</text>
+            <text x="24" y="214" fill="#a89c90" font-size="12">connection · two devices, one timetable</text>
+            <rect x="24" y="234" width="132" height="80" fill="#1b1714" stroke="#f3efe8" stroke-width="1.5"/>
+            <text x="90" y="270" text-anchor="middle">peripheral</text>
+            <text class="sm" x="90" y="292" text-anchor="middle" fill="#a89c90">GATT server</text>
+            <rect x="364" y="234" width="132" height="80" fill="#1b1714" stroke="#f3efe8" stroke-width="1.5"/>
+            <text x="430" y="270" text-anchor="middle">central</text>
+            <text class="sm" x="430" y="292" text-anchor="middle" fill="#a89c90">GATT client</text>
+            <g stroke="#9ec0ea" stroke-width="1.5" fill="none">
+              <path d="M364 258 H160 M168 252 L160 258 L168 264"/>
+              <path d="M156 292 H360 M352 286 L360 292 L352 298"/>
+            </g>
+            <text class="sm" x="260" y="250" text-anchor="middle" fill="#9ec0ea">read handle 0x0003</text>
+            <text class="sm" x="260" y="284" text-anchor="middle" fill="#9ec0ea">value</text>
+            <text class="sm" x="260" y="346" text-anchor="middle" fill="#a89c90">both hop across the other 37 channels</text>
+            <text x="260" y="390" text-anchor="middle" font-size="13">HciScanner listens · L2capAtt connects</text>
+          </svg>
+        </div>
+        <div class="scene" data-scene="stack">
+          <svg viewBox="0 0 520 420" role="img">
+            <title>From your program down to the radio, and where HCI, L2CAP, ATT and GATT sit</title>
+            <rect x="24" y="16" width="472" height="40" fill="#1b1714" stroke="#f3efe8" stroke-width="1.5"/>
+            <text x="260" y="41" text-anchor="middle">your program</text>
+            <rect x="24" y="72" width="472" height="56" fill="rgba(227,132,74,0.16)" stroke="#e3844a" stroke-width="1.5"/>
+            <line x1="260" y1="80" x2="260" y2="120" stroke="#e3844a"/>
+            <text class="sm" x="36" y="88" fill="#e3844a">rustle</text>
+            <text x="142" y="112" text-anchor="middle">scan · decode</text>
+            <text x="378" y="112" text-anchor="middle">GATT · ATT</text>
+            <rect x="24" y="144" width="472" height="56" fill="#1b1714" stroke="#f3efe8" stroke-width="1.5"/>
+            <line x1="260" y1="152" x2="260" y2="192" stroke="#2e2823"/>
+            <text class="sm" x="36" y="160" fill="#a89c90">Linux kernel</text>
+            <text x="142" y="184" text-anchor="middle">raw HCI socket</text>
+            <text x="378" y="184" text-anchor="middle">L2CAP socket</text>
+            <g stroke="#e3844a" stroke-width="1.6">
+              <line x1="142" y1="200" x2="142" y2="216"/>
+              <line x1="378" y1="200" x2="378" y2="216"/>
+            </g>
+            <rect x="24" y="216" width="472" height="48" fill="rgba(227,132,74,0.16)" stroke="#e3844a" stroke-width="1.5"/>
+            <text x="36" y="245" fill="#e3844a">HCI</text>
+            <text x="260" y="245" text-anchor="middle">commands down · events up</text>
+            <text class="sm" x="484" y="245" text-anchor="end" fill="#a89c90">USB or UART</text>
+            <rect x="24" y="280" width="472" height="56" fill="#1b1714" stroke="#f3efe8" stroke-width="1.5"/>
+            <text class="sm" x="36" y="296" fill="#a89c90">controller</text>
+            <text x="260" y="320" text-anchor="middle">the radio chip: channels, timing</text>
+            <g fill="none" stroke="#9ec0ea" stroke-width="1.5">
+              <path d="M244 356 A 22 22 0 0 0 244 388"/>
+              <path d="M232 348 A 34 34 0 0 0 232 396"/>
+              <path d="M276 356 A 22 22 0 0 1 276 388"/>
+              <path d="M288 348 A 34 34 0 0 1 288 396"/>
+            </g>
+            <text class="sm" x="260" y="414" text-anchor="middle" fill="#9ec0ea">2.4 GHz</text>
+            <text class="sm" x="484" y="66" text-anchor="end" fill="#6f655c">no bluetoothd, no D-Bus</text>
+          </svg>
+        </div>
+        <div class="scene" data-scene="path">
           <svg viewBox="0 0 520 420" role="img">
             <title>Passive scan path</title>
             <line x1="92" y1="28" x2="92" y2="108" stroke="#f3efe8" stroke-width="3"/>
@@ -200,16 +281,16 @@
             <g>
               <rect x="24" y="70" width="58" height="36" fill="#1b1714" stroke="#f3efe8"/>
               <text x="53" y="93" text-anchor="middle">04</text>
-              <text class="sm" x="53" y="124" text-anchor="middle" fill="#a89c90">event</text>
+              <text class="sm" x="53" y="124" text-anchor="middle" fill="#a89c90">packet</text>
               <rect x="86" y="70" width="58" height="36" fill="#1b1714" stroke="#f3efe8"/>
               <text x="115" y="93" text-anchor="middle">3E</text>
-              <text class="sm" x="115" y="124" text-anchor="middle" fill="#a89c90">meta</text>
+              <text class="sm" x="115" y="124" text-anchor="middle" fill="#a89c90">LE Meta</text>
               <rect x="148" y="70" width="58" height="36" fill="#1b1714" stroke="#f3efe8"/>
               <text x="177" y="93" text-anchor="middle">10</text>
               <text class="sm" x="177" y="124" text-anchor="middle" fill="#a89c90">length</text>
               <rect x="210" y="70" width="58" height="36" fill="rgba(227,132,74,0.16)" stroke="#e3844a"/>
               <text x="239" y="93" text-anchor="middle">02</text>
-              <text class="sm" x="239" y="124" text-anchor="middle" fill="#a89c90">report</text>
+              <text class="sm" x="239" y="124" text-anchor="middle" fill="#a89c90">subevent</text>
             </g>
             <text x="24" y="176" fill="#a89c90" font-size="12">advertising data</text>
             <g font-size="13">
@@ -288,8 +369,9 @@
             <g font-size="14">
               <line x1="78" y1="96" x2="92" y2="96" stroke="#f3efe8"/>
               <text x="64" y="101" text-anchor="end">0001</text>
-              <text x="104" y="101" fill="#a89c90">1800</text>
+              <text x="104" y="101" fill="#a89c90">2800</text>
               <text x="160" y="101">Generic Access</text>
+              <text x="300" y="101" fill="#a89c90">1800</text>
               <line x1="78" y1="140" x2="92" y2="140" stroke="#f3efe8"/>
               <text x="64" y="145" text-anchor="end">0002</text>
               <text x="104" y="145" fill="#a89c90">2803</text>
@@ -348,18 +430,36 @@
     </div>
 
     <div class="chapters">
+      <section class="ch" id="radio" data-scene="radio">
+        <div class="kicker">the radio</div>
+        <h2>Bluetooth Low Energy does two things.</h2>
+        <p>A BLE device either advertises or holds a connection. Advertising is a broadcast. The device sends a short packet, up to 31 bytes in the original format, on three advertising channels, and repeats it anywhere from 50 times a second to once every ten seconds. Anyone nearby can listen. Nothing is addressed to the listener, and nothing is acknowledged.</p>
+        <p>Each packet carries the sender’s six-byte address. The listening radio also measures how strongly the packet arrived, the RSSI, in dBm. Numbers nearer zero are stronger: −48 is close, −90 is far.</p>
+        <p>A connection is a private conversation. The <em>central</em>, here your computer, answers a connectable advertisement, and the two agree on a timetable and hop together across the other 37 of BLE’s 40 channels. The central asks for values and the <em>peripheral</em> answers.</p>
+        <p class="quiet">rustle does both halves. <code>HciScanner</code> listens to advertisements. <code>L2capAtt</code> and <code>GattClient</code> make the connection and ask the questions.</p>
+      </section>
+
+      <section class="ch" id="stack" data-scene="stack">
+        <div class="kicker">the stack</div>
+        <h2>The acronyms, from the chip up.</h2>
+        <p>The radio is its own chip, the <em>controller</em>. Your computer, the <em>host</em>, steers it through <strong>HCI</strong>, the Host Controller Interface. HCI is a message format the Bluetooth specification fixes, usually carried over USB or a serial line. The host sends commands, such as “start scanning”. The controller sends back events, such as “I heard this advertisement”. Because every controller speaks it, rustle can drive the one on the board or a USB dongle.</p>
+        <p>Once connected, the two devices talk <strong>ATT</strong>, the Attribute Protocol. The peripheral keeps a numbered table of small values. Each row has a number, its <em>handle</em>, and a type, its <em>UUID</em>. The central says “read row 3” or “write row 4”. ATT rides on one fixed channel of <strong>L2CAP</strong>, the layer that shares a connection between protocols.</p>
+        <p><strong>GATT</strong>, the Generic Attribute Profile, is how that table is arranged: rows grouped into <em>services</em>, such as Battery, with <em>characteristics</em> inside them, such as Battery Level. A characteristic can also push its value when it changes, a <em>notification</em>, once the central asks for that.</p>
+        <p class="quiet">Most Linux programs reach all of this through <code>bluetoothd</code> over D-Bus. rustle skips both. It scans on the kernel’s raw HCI socket and talks ATT on an L2CAP socket. The kernel still makes the connection.</p>
+      </section>
+
       <section class="ch" id="path" data-scene="path">
         <div class="kicker">the path</div>
         <h2>Four steps, then your loop.</h2>
         <p>A usual BLE stack arrives with a runtime, a D-Bus client, and somebody else’s library. rustle is the short version of that drawing. <code>HciScanner</code> opens a raw HCI socket. <code>read</code> returns one datagram. <code>parse_hci_packet</code> turns an advertising report into an address, an address type, an RSSI, a PDU kind, and the advertising data.</p>
         <p>The default scan is passive. The controller listens. It transmits nothing. Drop the scanner and the scan stops.</p>
-        <p class="quiet"><code>start</code> asks for the Bluetooth 5 extended scan first. A controller that rejects it gets the legacy commands instead. A coded-PHY-only scan has no legacy equivalent, so that one fails rather than listening on the wrong radio.</p>
+        <p class="quiet"><code>start</code> asks for the Bluetooth 5 extended scan first. A controller that rejects it gets the legacy commands instead. A coded-PHY-only scan has no legacy equivalent, so that one fails rather than listening on the wrong PHY.</p>
       </section>
 
       <section class="ch" id="packet" data-scene="packet">
         <div class="kicker">one event</div>
         <h2>The bytes are from a test, not a brochure.</h2>
-        <p>Every <code>read</code> is one HCI event. Advertising reports are the ones that start <code>04 3E</code>. The next byte is how many parameter bytes follow. Subevent <code>02</code> is a legacy LE Advertising Report. Extended reports use <code>0D</code>, which is why the extended commands matter: once a controller is scanning that way, legacy advertisements show up there too.</p>
+        <p>Every <code>read</code> is one HCI event. <code>04</code> marks an event packet and <code>3E</code> an LE Meta event. The next byte is how many parameter bytes follow, and the first of those names the subevent. Subevent <code>02</code> is a legacy LE Advertising Report. Extended reports use <code>0D</code>, and once the extended scan commands are in use, legacy advertisements arrive as <code>0D</code> reports too. rustle decodes both.</p>
         <p>The name in the picture is one AD structure. <code>03</code> says three bytes follow, <code>09</code> says complete local name, <code>46 53</code> is <code>FS</code>. RSSI <code>D0</code> is −48 dBm. <code>7F</code> would have meant the controller had no reading, and rustle stores that as absent rather than +127.</p>
         <a class="receipt" href="https://github.com/herbenderbler/rustle/blob/main/src/hci.rs#L1241">
           <div class="who">src/hci.rs · hci_packet_unwraps_le_advertising_report</div>
@@ -367,14 +467,14 @@
 assert_eq!(reports[0].ad.local_name.as_deref(), Some("FS"));</pre>
           <div class="where">github.com/herbenderbler/rustle</div>
         </a>
-        <p class="quiet">A structure that claims more bytes than remain is dropped. A length of zero ends the list. The fields decoded before that point are kept. The parse does not panic.</p>
+        <p class="quiet">This is the legacy report shape, the one a controller sends on the legacy fallback. Under the extended commands the same advertisement arrives as a <code>0D</code> report with a longer header, and decodes to the same fields. A structure that claims more bytes than remain is dropped. A length of zero ends the list. The fields decoded before that point are kept. The parse does not panic.</p>
       </section>
 
       <section class="ch" id="address" data-scene="address">
         <div class="kicker">the address</div>
         <h2>It is stored backwards.</h2>
         <p>HCI puts the six address bytes least-significant first. <code>format_addr_le</code> reverses them into the usual <code>70:C9:4E:AA:BB:CC</code> form. Connect with that string.</p>
-        <p>The other thing a connection needs is whether the address is random. That is <code>addr_type</code> on the report, not something you can see in the hex of the address itself. Pass it through as <code>peer_random</code>. The wrong flag makes the kernel look for a device that is not there, and the connect times out.</p>
+        <p>The other thing a connection needs is whether the address is random. That is <code>addr_type</code> on the report, not something you can see in the hex of the address itself. Pass <code>addr_type == AddrType::Random</code> as <code>peer_random</code>. The wrong flag makes the kernel look for a device that is not there, and the connect times out.</p>
         <a class="receipt" href="https://github.com/herbenderbler/rustle/blob/main/src/hci.rs#L671">
           <div class="who">src/hci.rs · addr_is_reversed_and_uppercased</div>
           <pre>let addr = [0xcc, 0xbb, 0xaa, 0x4e, 0xc9, 0x70];
@@ -385,9 +485,9 @@ assert_eq!(format_addr_le(&amp;addr), "70:C9:4E:AA:BB:CC");</pre>
 
       <section class="ch" id="merge" data-scene="merge">
         <div class="kicker">two reports</div>
-        <h2>An active scan hears the device twice.</h2>
-        <p>Passive was listen-only. Active means the controller answers a scannable advertisement with <code>SCAN_REQ</code>, and the <code>SCAN_RSP</code> comes back as a second event. A lot of devices put their name only in that second packet.</p>
-        <p><code>ScanMerger</code> holds the primary for a short wait, then emits one advertisement. A longer local name from the response replaces a shorter one. The same length keeps the primary’s. Call <code>flush_stale</code> on the way through, or a device that never answers stays in the hold forever.</p>
+        <h2>An active scan can hear the device twice.</h2>
+        <p>Passive was listen-only. Active means the controller answers a scannable advertisement with <code>SCAN_REQ</code>, and the <code>SCAN_RSP</code>, when it arrives, is a second advertising report. A lot of devices put their name only in that second packet.</p>
+        <p><code>ScanMerger</code> holds the primary until its response arrives or the wait you gave it runs out, then emits one <code>MergedAdv</code>. A longer local name from the response replaces a shorter one. The same length keeps the primary’s. Call <code>flush_stale</code> on the way through, or a device that never answers stays in the hold forever.</p>
         <p class="quiet">Filter after the merge. <code>ScanFilter</code> keeps a report when every criterion you set matches. Several entries in one criterion match any of them. An empty criterion is skipped, so the default filter keeps everything.</p>
       </section>
 
@@ -395,14 +495,14 @@ assert_eq!(format_addr_le(&amp;addr), "70:C9:4E:AA:BB:CC");</pre>
         <div class="kicker">handles</div>
         <h2>The UUID names the thing. The handle is how you use it.</h2>
         <p><code>L2capAtt</code> opens the ATT channel. The kernel brings the LE link up. ATT lives on fixed channel <code>0x0004</code>. The MTU starts at 23 and stays there until <code>exchange_mtu</code>.</p>
-        <p>Handles are not implied by the UUID. They differ from device to device, so you discover the table and then <code>read</code> or <code>subscribe</code> by handle. The ruler is the discovery test’s Generic Access service: Device Name at value handle <code>0x0003</code>, its CCCD at <code>0x0004</code>, the service running through <code>0x0009</code>. <code>next_event</code> returns the value handle, the <code>0003</code>, not the descriptor you wrote to turn notifications on.</p>
+        <p>Handles are not implied by the UUID. They differ from device to device, so you discover the table and then <code>read</code> or <code>subscribe</code> by handle. The ruler is the discovery test’s Generic Access service: Device Name at value handle <code>0x0003</code>, its CCCD at <code>0x0004</code>, the service running through <code>0x0009</code>. <code>next_event</code> returns the value handle, the <code>0003</code>, not the descriptor you wrote to turn notifications on. The mock gives Device Name a notify flag so the test has a CCCD to find. On a real device Device Name is read, and sometimes write, but never notify.</p>
         <a class="receipt" href="https://github.com/herbenderbler/rustle/blob/main/src/client.rs#L819">
           <div class="who">src/client.rs · discover_all_walks_service_characteristic_descriptor_tree</div>
           <pre>assert_eq!(ch.characteristic.value_handle, 0x0003);
 assert_eq!(ch.descriptors[0].handle, 0x0004);</pre>
           <div class="where">one table, from a mock. the next device will differ.</div>
         </a>
-        <p class="quiet"><code>SecurityLevel::Low</code> leaves the link unpaired. <code>Medium</code> and <code>High</code> wait until the link actually reaches that level, which means a pairing agent has to approve the request.</p>
+        <p class="quiet"><code>SecurityLevel::Low</code> does not ask for pairing. <code>Medium</code> and <code>High</code> wait until the link actually reaches that level, so the kernel has to pair, and a pairing agent has to approve it. Agents come from programs such as <code>bluetoothd</code>, so pairing needs one running.</p>
       </section>
 
       <section class="ch" id="layers" data-scene="layers">
@@ -413,7 +513,7 @@ assert_eq!(ch.descriptors[0].handle, 0x0004);</pre>
         <a class="receipt" href="https://github.com/herbenderbler/rustle/blob/main/src/client.rs#L69">
           <div class="who">src/client.rs · DEFAULT_ATT_MTU</div>
           <pre>pub const DEFAULT_ATT_MTU: u16 = 23;</pre>
-          <div class="where">23 until exchange_mtu. the mock can answer with less.</div>
+          <div class="where">23 until exchange_mtu. a server that offers less still gets 23.</div>
         </a>
       </section>
     </div>
@@ -454,7 +554,7 @@ assert_eq!(ch.descriptors[0].handle, 0x0004);</pre>
     <h2>Running it.</h2>
     <p>A passive scan needs <code>CAP_NET_RAW</code>. An active scan also needs <code>CAP_NET_ADMIN</code>, because the kernel treats that scan as a device discovery and rustle ends the discovery on the way out. Run the <code>setcap</code> again after every rebuild.</p>
     <div class="run"><code>cargo build --example battery
-sudo setcap cap_net_raw+ep target/debug/examples/battery
+sudo setcap cap_net_raw,cap_net_admin+ep target/debug/examples/battery
 target/debug/examples/battery Polar</code></div>
     <p class="note">The three examples are <a href="https://github.com/herbenderbler/rustle/tree/main/examples"><code>scan</code>, <code>battery</code>, and <code>probe</code></a>. Setup is <a href="https://github.com/herbenderbler/rustle/blob/main/INSTALL.md">INSTALL.md</a>, the longer guide is <a href="https://github.com/herbenderbler/rustle/blob/main/USAGE.md">USAGE.md</a>, and the module map is <a href="https://github.com/herbenderbler/rustle/blob/main/ARCHITECTURE.md">ARCHITECTURE.md</a>.</p>
   </main>
@@ -472,7 +572,7 @@ target/debug/examples/battery Polar</code></div>
     ["$ ", "k"],
     ["cargo run --example scan\n", ""],
     ["hci0: passive scan with the Extended commands for 10 s\n", "c"],
-    ["70:C9:4E:AA:BB:CC  -48 dBm  FS\n", "s"]
+    ["70:C9:4E:AA:BB:CC -48 dBm FS\n", "s"]
   ];
   var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   function paint(done) {
@@ -583,9 +683,20 @@ target/debug/examples/battery Polar</code></div>
     }
     return name;
   }
+  // Legacy advertising data is at most 31 bytes, so one name structure
+  // (length byte + type byte + name) holds at most 29 bytes of name.
+  var NAME_MAX = 29;
+  function clip(text) {
+    var s = "";
+    Array.from(text).every(function (ch) {
+      if (enc.encode(s + ch).length > NAME_MAX) return false;
+      s += ch;
+      return true;
+    });
+    return s;
+  }
   function adOf(text, type) {
     var raw = Array.from(enc.encode(text));
-    if (raw.length > 254) raw = raw.slice(0, 254);
     return [raw.length + 1, type].concat(raw);
   }
   function shorter(name) {
@@ -608,9 +719,9 @@ target/debug/examples/battery Polar</code></div>
     return enc.encode(b).length > enc.encode(a).length ? b : a;
   }
   function eventOf(ad) {
+    // num_reports 1, event_type 00 (ADV_IND), addr_type 00 (public).
     var report = [0x01, 0x00, 0x00].concat(ADDR, [ad.length], ad, [0xd0]);
     var sub = [0x02].concat(report);
-    if (sub.length > 255) return null;
     return [0x04, 0x3e, sub.length].concat(sub);
   }
   function escHtml(s) {
@@ -620,7 +731,8 @@ target/debug/examples/battery Polar</code></div>
     return '<div class="row"><dt>' + escHtml(k) + '</dt><dd>' + escHtml(v) + '</dd></div>';
   }
   function paintTry() {
-    var typed = nameEl.value;
+    var typed = clip(nameEl.value);
+    var clipped = typed !== nameEl.value;
     var primaryAd, responseAd, shown, detail;
     if (trunc) {
       var raw = Array.from(enc.encode(typed || "X"));
@@ -649,14 +761,18 @@ target/debug/examples/battery Polar</code></div>
       detail = "One complete-local-name structure. Length counts the type byte plus the name.";
       wireEl.textContent = hex(eventOf(primaryAd));
     }
+    var merged = active && !trunc && !!typed;
     var lines = [
+      row("type", merged ? "MergedAdv" : "AdvReport"),
       row("address", formatAddr(ADDR)),
-      row("addr_type", "public"),
-      row("rssi", rssi(0xd0) + " dBm"),
-      row("pdu", active && !trunc ? "MergedAdv" : "ADV_IND"),
-      row("local_name", shown == null ? "absent" : shown)
+      row("addr_type", "Public"),
+      row("rssi", "Some(" + rssi(0xd0) + ")")
     ];
+    // A MergedAdv has no pdu field: the merge already consumed it.
+    if (!merged) lines.push(row("pdu", "ScannablePrimary"));
+    lines.push(row("local_name", shown == null ? "None" : "Some(\"" + shown + "\")"));
     outEl.innerHTML = lines.join("");
+    if (clipped) detail += " Legacy advertising data holds 31 bytes, so the name was cut to " + enc.encode(typed).length + " bytes.";
     because.textContent = detail;
   }
   nameEl.addEventListener("input", paintTry);
