@@ -330,11 +330,15 @@ the link reaches the level and fails if it does not. The channel's
 
 The kernel asks for every pairing to be approved, even one that needs no
 passkey. Normally `bluetoothd` passes the request to a registered pairing
-agent, such as a desktop's Bluetooth applet, which asks the user. Without
-one, nothing approves it: the pairing stalls, `connect` fails with
-`TimedOut`, and the kernel holds the link until it abandons the pairing
-about 30 seconds later. Stay on `Low` unless the device answers reads or
-writes with ATT error `0x05` or `0x0F`.
+agent, such as a desktop's Bluetooth applet or `bluetoothctl`, which asks
+the user; they have about 30 seconds to answer. Without an agent nothing
+approves it and the pairing stalls. About 30 seconds in, the kernel
+abandons the pairing and drops the link, and `connect` fails with
+`ConnectionAborted`. A `connect_timeout` shorter than that fails with
+`TimedOut` first. `High` fails the same way with a device that has no
+display or keyboard, because such a device cannot authenticate a key.
+Stay on `Low` unless the device answers reads or writes with ATT error
+`0x05` or `0x0F`.
 
 Some devices ask to pair as soon as the link is up, whatever the security
 level. If such a device wants a passkey, nothing can answer it without
@@ -555,7 +559,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `GattError::Protocol` | The response could not be decoded or was not the one expected. | Report it with the PDU bytes. |
 | `RssiError::NoConnection` | No LE connection to that peer on that adapter. | Connect first. |
 | `TimedOut` from `connect_timeout` | The peer did not answer in time. | See below. |
-| `TimedOut` from a connect at `Medium` or `High`, saying pairing did not finish | The link came up, but nothing approved the pairing. | Run `bluetoothd` with a pairing agent, or connect at `Low`. |
+| `ConnectionAborted` from a connect at `Medium` or `High`, saying the link closed before reaching that security, or `TimedOut` saying pairing did not finish | The link came up, but nothing approved the pairing, or the device cannot reach that level. | Run `bluetoothd` with a pairing agent, or connect at a lower level. |
 
 ## Troubleshooting
 
@@ -583,10 +587,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   confirm it is visible, and check `peer_random` against the report's
   `addr_type`. If `btmgmt find` reports `Busy` on that adapter, a stuck
   discovery is holding the kernel back; see the first entry.
-- **A connect at `Medium` or `High` fails with "pairing did not finish".**
-  The kernel paired as far as asking for approval, and nothing approved.
-  `btmon` shows `SMP: Pairing Random`, then `MGMT Event: User Confirmation
-  Request` with no reply. See "Connect to a device".
+- **A connect at `Medium` or `High` fails after about 30 seconds.** The
+  error says the link closed before reaching that security, or that
+  pairing did not finish. The kernel paired as far as asking for approval,
+  and nothing approved: `btmon` shows `SMP: Pairing Random`, then `MGMT
+  Event: User Confirmation Request` with no reply. Register a pairing
+  agent, for example by running `bluetoothctl` and entering
+  `default-agent`, and approve the request when it asks. At `High`, the
+  device may be unable to authenticate a key at all. See "Connect to a
+  device".
 - **Requests fail with `PermissionDenied` right after connecting.** The
   device asked to pair and nothing could answer its passkey; see "Connect
   to a device".

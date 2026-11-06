@@ -340,11 +340,13 @@ mod linux_impl {
         ///
         /// Above [`SecurityLevel::Low`] it returns only once the link has
         /// reached `security`, because the kernel connects first and pairs
-        /// afterwards. It fails if the link drops first, or with
-        /// [`io::ErrorKind::TimedOut`] if pairing has not finished within 40 s,
-        /// longer than the kernel's own 30 s pairing timeout. The kernel asks a
-        /// pairing agent to approve every pairing, Just Works included, so
-        /// without one, such as `bluetoothd` with an agent registered, it fails.
+        /// afterwards. It fails if the link drops first, as it does when the
+        /// kernel abandons an unfinished pairing after about 30 s (usually
+        /// [`io::ErrorKind::ConnectionAborted`]), or with
+        /// [`io::ErrorKind::TimedOut`] if the link is still short of
+        /// `security` after 40 s. The kernel asks a pairing agent to approve
+        /// every pairing, Just Works included, so without one, such as
+        /// `bluetoothd` with an agent registered, it fails.
         pub fn connect(
             local: Option<&str>,
             local_random: bool,
