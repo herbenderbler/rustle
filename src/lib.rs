@@ -27,6 +27,7 @@
 //! | [`client`] | [`client::GattClient`], generic over an [`client::AttIo`] transport | — |
 //! | [`l2cap`] | address helpers, [`l2cap::SecurityLevel`] | [`l2cap::L2capAtt`]: a connected L2CAP ATT channel |
 //! | [`conn`] | Read RSSI and connection-list codecs | [`conn::read_rssi`] and [`conn::connections`]: RSSI of an established LE connection, and the connections an adapter carries |
+//! | [`mgmt`] | management command and reply codecs | [`mgmt::end_discovery`]: ends the device discovery the kernel believes an active scan started |
 //!
 //! # Scanning
 //!
