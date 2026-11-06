@@ -4,70 +4,32 @@
 
 # rustle
 
-A dependency-free Bluetooth Low Energy stack for Linux hosts: raw-HCI
-scanning, advertisement parsing, and an ATT/GATT client over L2CAP.
+rustle is a Bluetooth Low Energy (BLE) library for Linux, written in plain
+Rust. It scans for nearby devices, decodes their advertisements, and talks
+to them over GATT.
 
-Everything is plain `std`. There are no C libraries, no D-Bus, no async
-runtime and no third-party crates: the kernel's BlueZ sockets are driven
-directly through a handful of `extern "C"` libc calls. The byte parsers that
-face the radio are fuzzed (`fuzz/`) and never panic on malformed input.
+rustle has no dependencies. It needs no C libraries, no D-Bus and no async
+runtime. It talks to the kernel's Bluetooth sockets directly.
 
-rustle began life as the in-house BLE stack of
-[fflock](https://github.com/herbenderbler/fflock), where it replaced an
-external BLE stack, together with its async runtime and D-Bus bindings, with
-a receive-only scanner that could be audited end to end. It is now maintained
-here as a standalone library.
+## Features
 
-## Documentation
+- Passive and active scanning, including Bluetooth 5 extended advertising.
+- Decoding of names, service UUIDs, manufacturer data and other
+  advertising data.
+- Filtering of scan results by service, name prefix or manufacturer.
+- A GATT client for discovery, reads, writes and notifications.
+- Fuzzed parsers that never panic on malformed input.
 
-- [INSTALL.md](INSTALL.md): toolchain, adding the crate to a project,
-  socket permissions and freeing the adapter from `bluetoothd`.
-- [USAGE.md](USAGE.md): a walk through scanning, filtering, connecting,
-  GATT reads and writes, notifications and testing without a radio.
-- Examples: `examples/scan.rs` lists nearby devices,
-  `examples/battery.rs` connects to one and reads its battery level, and
-  `examples/probe.rs` connects to one and runs the discovery, RSSI,
-  notification and security checks from USAGE.md.
-- API reference: `cargo doc --open`.
+## Quick start
 
-## What's in the box
+rustle is not on crates.io. Add it as a Git dependency and pin a commit:
 
-| Module | Pure (any OS) | Linux socket layer |
-|---|---|---|
-| `hci` | HCI event framing, LE Advertising Report (legacy + extended) and AD-structure decoding, HCI command framing | — |
-| `scan` | scan parameters and their wire encodings | `HciScanner`: a raw HCI socket programmed for passive or active LE scanning, extended-scan with legacy fallback |
-| `scan_merge` | pairs a scannable advertisement with its `SCAN_RSP` | — |
-| `scan_filter` | `ScanFilter`: client-side matching of decoded advertisements against service UUIDs, a name prefix and manufacturer IDs | — |
-| `adapter` | `hci_dev_info` decoding, adapter selection | `enumerate()`: `HCIGETDEVLIST` / `HCIGETDEVINFO` |
-| `att` | ATT PDU encoder / decoder | — |
-| `gatt` | GATT declarations, characteristic properties, CCCD values | — |
-| `client` | `GattClient`, generic over an `AttIo` transport (MTU exchange, discovery, read / read-long / write with and without response, notifications) | — |
-| `l2cap` | address helpers, `SecurityLevel` | `L2capAtt`: a connected L2CAP ATT channel implementing `AttIo` |
-| `conn` | Read RSSI and connection-list codecs | `read_rssi()` and `connections()`: RSSI of an established LE connection, and the connections an adapter currently carries |
-| `mgmt` | management command and reply codecs | `end_discovery()`: ends the device discovery the kernel believes an active scan started |
+```toml
+[dependencies]
+rustle = { git = "https://github.com/herbenderbler/rustle", rev = "<commit>" }
+```
 
-Every module keeps its pure layer separate from its socket layer, so the
-protocol logic is unit-tested on any OS without a radio, and the `GattClient`
-is tested against an in-memory transport.
-
-## Platform support
-
-The socket layers are Linux-only (`#[cfg(target_os = "linux")]`) and need
-`CAP_NET_RAW` (or root). Active scans also need `CAP_NET_ADMIN`: the kernel
-reads an active scan as the start of a device discovery, and the scanner
-ends that discovery through the kernel's management interface so it does
-not block the kernel's own connections. The scanner programs the
-controller directly, without telling the kernel or `bluetoothd`, and turns
-off any scan already running on it. Run it on an adapter nothing else
-scans on: stop `bluetoothd`, or give rustle an adapter of its own.
-[INSTALL.md](INSTALL.md) explains what goes wrong otherwise.
-
-On other platforms the crate still builds and the socket types still exist,
-but they cannot be constructed: `HciScanner::open`, `L2capAtt::connect` and
-`adapter::enumerate` return an "unsupported" error. Platform-generic code
-therefore compiles everywhere; only the Linux build can talk to hardware.
-
-## Scanning
+This program lists the devices it hears on `hci0`:
 
 ```rust,no_run
 use rustle::hci::parse_hci_packet;
@@ -75,59 +37,45 @@ use rustle::scan::{HciScanner, ScanParams};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // hci0, with a 1 s receive timeout so the loop can check a shutdown flag.
-    let mut scanner = HciScanner::open(0, Duration::from_secs(1))?;
-    // The default is a passive scan: the controller listens and transmits nothing.
-    let start = scanner.start(ScanParams::default())?;
-    println!("scanning in {:?} mode", start.mode);
+    // A zero timeout makes each read wait until a packet arrives.
+    let mut scanner = HciScanner::open(0, Duration::ZERO)?;
+    // The default scan is passive. The radio listens and sends nothing.
+    scanner.start(ScanParams::default())?;
 
     let mut buf = [0u8; 512];
     loop {
-        match scanner.read(&mut buf) {
-            Ok(n) => {
-                for report in parse_hci_packet(&buf[..n]) {
-                    println!("{} rssi={:?} name={:?}",
-                        report.address, report.rssi, report.ad.local_name);
-                }
-            }
-            // Receive timeout / signal: nothing yet.
-            Err(e) if matches!(e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => continue,
-            Err(e) => return Err(e.into()),
+        let n = scanner.read(&mut buf)?;
+        for report in parse_hci_packet(&buf[..n]) {
+            println!("{} {:?} {:?}", report.address, report.rssi, report.ad.local_name);
         }
     }
 }
 ```
 
-`ScanParams::default()` is a passive scan: the controller only listens.
-`HciScanner::start` prefers the Bluetooth 5 extended scan commands and
-falls back to the legacy ones on a controller that rejects them.
-`ScanParams::phys` selects the PHYs an extended scan listens on: LE 1M,
-the long range LE Coded PHY, or both. A Coded-only scan has no legacy
-equivalent, so it fails rather than falling back. Dropping the scanner
-stops the scan and closes the socket. [USAGE.md](USAGE.md) covers active
-scans, scan response merging and filtering.
+The program needs the `CAP_NET_RAW` capability, or root. It works best on
+an adapter that `bluetoothd` is not using. [INSTALL.md](INSTALL.md)
+explains both and shows how to run the bundled examples.
 
-## GATT
+## Requirements
 
-`l2cap::L2capAtt` opens an ATT channel to a peer, and `client::GattClient`
-drives MTU exchange, discovery, reads, writes and notifications over it.
-The client is generic over the `AttIo` trait, so a mock transport serves
-for tests. [USAGE.md](USAGE.md) has the full walk, from connect to
-notification loop.
+- Rust 1.88 or newer.
+- Linux with BlueZ support in the kernel.
+- A Bluetooth controller that supports Low Energy.
 
-## Fuzzing
+The crate also builds on other systems, but only Linux can reach the radio.
 
-`fuzz/` holds `cargo-fuzz` targets for the HCI packet, AD-structure and ATT
-PDU parsers. It is its own nightly-only workspace; see `fuzz/README.md`. The
-stable-toolchain `tests/parser_no_panic.rs` harness feeds the same parsers a
-large deterministic mix of random and mutated bytes on every CI run.
+## Documentation
 
-## Minimum supported Rust version
-
-1.88, checked in CI. Only `std` is used, so bumping it is never forced by a
-dependency.
+- [INSTALL.md](INSTALL.md) covers setup, permissions and the adapter.
+- [USAGE.md](USAGE.md) is a guide to scanning, connecting and GATT.
+- [ARCHITECTURE.md](ARCHITECTURE.md) describes the modules, the design
+  and the tests.
+- [examples/](examples) holds three small programs. `scan` lists nearby
+  devices, `battery` reads a device's battery level, and `probe` runs a
+  set of connection checks.
+- `cargo doc --open` builds the API reference.
 
 ## License
 
-MIT OR Apache-2.0.
+rustle is licensed under either the [MIT license](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option.

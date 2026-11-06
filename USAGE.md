@@ -1,9 +1,10 @@
 # Using rustle
 
 This guide walks through the tasks rustle supports, in the order a program
-performs them. The [README](README.md) gives the overview and the module
-map. [INSTALL.md](INSTALL.md) covers the toolchain, socket permissions and
-the adapter.
+performs them. The [README](README.md) gives the overview, and
+[ARCHITECTURE.md](ARCHITECTURE.md) has the module map.
+[INSTALL.md](INSTALL.md) covers the toolchain, socket permissions and the
+adapter.
 
 Every Rust block in this file is compiled by `cargo test`, so the examples
 match the current API. If BLE itself is new to you, start with Concepts
