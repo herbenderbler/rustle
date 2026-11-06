@@ -9,7 +9,7 @@
 //!
 //! Pure and platform-independent, like the parsers it consumes.
 
-use crate::hci::{format_uuid16, format_uuid32, AdvReport, ParsedAd};
+use crate::hci::{format_uuid128, format_uuid16, format_uuid32, AdvReport, ParsedAd};
 
 /// Criteria for keeping an advertisement.
 ///
@@ -88,17 +88,9 @@ pub fn normalize_uuid(uuid: &str) -> Option<String> {
     match hex.len() {
         4 => Some(format_uuid16(u16::from_str_radix(&hex, 16).ok()?)),
         8 => Some(format_uuid32(u32::from_str_radix(&hex, 16).ok()?)),
-        32 => {
-            let h = hex.to_ascii_lowercase();
-            Some(format!(
-                "{}-{}-{}-{}-{}",
-                &h[0..8],
-                &h[8..12],
-                &h[12..16],
-                &h[16..20],
-                &h[20..32]
-            ))
-        }
+        32 => Some(format_uuid128(
+            &u128::from_str_radix(&hex, 16).ok()?.to_le_bytes(),
+        )),
         _ => None,
     }
 }

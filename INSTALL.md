@@ -223,8 +223,10 @@ release.
 
 ## Contributor checks
 
-CI runs three checks beyond the tests. Run them before opening a pull
-request.
+Beyond the tests, CI checks formatting, lints and documentation on Linux.
+It also runs the lints and tests on macOS, where the socket layers are
+stubs, and builds with the minimum supported Rust, 1.88. Run the three
+checks below before opening a pull request.
 
 Formatting:
 

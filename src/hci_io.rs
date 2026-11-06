@@ -26,6 +26,8 @@ pub(crate) trait HciIo {
     fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize>;
 }
 
+/// Lets a test lend its transport to a driver and inspect it afterwards.
+#[cfg(test)]
 impl<T: HciIo + ?Sized> HciIo for &mut T {
     fn write_packet(&mut self, pkt: &[u8]) -> io::Result<()> {
         (**self).write_packet(pkt)
@@ -91,10 +93,7 @@ pub(crate) fn await_response<T: HciIo, R>(
                 if matches!(
                     e.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                continue;
-            }
+                ) => {} // Nothing yet: read again.
             Err(e) => return Err(CommandError::Io(e)),
         }
     }

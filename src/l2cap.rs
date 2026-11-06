@@ -297,23 +297,25 @@ mod linux_impl {
                 return Err(io::Error::last_os_error());
             }
 
-            // Requested security level. Low is the kernel's default, so only a
-            // failure to ask for more matters.
-            let sec = BtSecurity {
-                level: security as u8,
-                key_size: 0,
-            };
-            let rc = unsafe {
-                setsockopt(
-                    fd,
-                    SOL_BLUETOOTH,
-                    BT_SECURITY,
-                    &sec as *const BtSecurity as *const c_void,
-                    std::mem::size_of::<BtSecurity>() as u32,
-                )
-            };
-            if rc < 0 && security > SecurityLevel::Low {
-                return Err(io::Error::last_os_error());
+            // Requested security level. Low is the kernel's default for a new
+            // socket, so there is nothing to ask for.
+            if security > SecurityLevel::Low {
+                let sec = BtSecurity {
+                    level: security as u8,
+                    key_size: 0,
+                };
+                let rc = unsafe {
+                    setsockopt(
+                        fd,
+                        SOL_BLUETOOTH,
+                        BT_SECURITY,
+                        &sec as *const BtSecurity as *const c_void,
+                        std::mem::size_of::<BtSecurity>() as u32,
+                    )
+                };
+                if rc < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
 
             // Receive timeout so a notify read loop stays responsive to shutdown.

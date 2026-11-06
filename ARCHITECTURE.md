@@ -23,7 +23,7 @@ radio are fuzzed, and they never panic on malformed input.
 | `scan` | Scan parameters and their wire encodings | `HciScanner`, a raw HCI socket set up for passive or active scanning. It uses extended scanning where the controller supports it and falls back to legacy scanning. |
 | `scan_merge` | Pairs a scannable advertisement with its scan response | |
 | `scan_filter` | `ScanFilter`, which matches decoded advertisements against service UUIDs, a name prefix and manufacturer IDs | |
-| `adapter` | Decoding of `hci_dev_info` and adapter selection | `enumerate()`, built on `HCIGETDEVLIST` and `HCIGETDEVINFO` |
+| `adapter` | Decoding of `hci_dev_info` and adapter selection | `enumerate()` and `info()`, built on `HCIGETDEVLIST` and `HCIGETDEVINFO` |
 | `att` | ATT PDU encoder and decoder | |
 | `gatt` | GATT declarations, characteristic properties and CCCD values | |
 | `client` | `GattClient`, generic over an `AttIo` transport. It handles MTU exchange, discovery, reads, long reads, writes with and without a response, and notifications. | |
@@ -54,9 +54,10 @@ scans on. You can stop `bluetoothd` or give rustle an adapter of its own.
 
 Active scans also need `CAP_NET_ADMIN`. The kernel treats an active scan as
 the start of a device discovery. While that discovery runs, the kernel
-refuses new ones and makes no LE connections on the adapter. The scanner
-ends the discovery through the kernel's management interface when the scan
-stops.
+refuses new ones and makes no LE connections on the adapter. Through the
+kernel's management interface, the scanner ends any discovery already in
+progress before an active scan starts, and the one the scan started when
+it stops.
 
 [INSTALL.md](INSTALL.md) explains the permissions, how to free the adapter
 and how to recover a stuck discovery.

@@ -320,7 +320,7 @@ mod tests {
     fn choose_prefers_the_named_interface() {
         assert_eq!(choose(&adapters(), "hci1"), (1, true));
         assert_eq!(choose(&adapters(), "hci0"), (0, true));
-        // Case-insensitive, matching the interact-path selector.
+        // Case-insensitive: "HCI1" names the same adapter as "hci1".
         assert_eq!(choose(&adapters(), "HCI1"), (1, true));
     }
 

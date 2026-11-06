@@ -141,8 +141,7 @@ impl AddrType {
         }
     }
 
-    /// Lowercase string form (`"public"` / `"random"`), matching the address-type
-    /// field the detection records carry.
+    /// Lowercase string form, `"public"` or `"random"`.
     pub fn as_str(self) -> &'static str {
         match self {
             AddrType::Public => "public",
@@ -207,8 +206,8 @@ pub struct AdvReport {
     /// (no OUI) from a public one.
     pub addr_type: AddrType,
     /// RSSI in dBm (the trailing signed byte of the report), or `None` when the
-    /// controller reports `0x7F` ("RSSI is not available", BT Core spec) — which
-    /// must not be stored as +127 dBm (it poisons the homing / `rssi_trend` peak).
+    /// controller reports `0x7F` ("RSSI is not available", BT Core spec), which
+    /// must not be read as +127 dBm.
     pub rssi: Option<i32>,
     /// Which advertising PDU this is, so a scannable primary and its SCAN_RSP can
     /// be coalesced (see [`AdvPdu`] and [`crate::scan_merge`]).
@@ -450,7 +449,8 @@ pub fn parse_le_extended_advertising_report(params: &[u8]) -> Vec<AdvReport> {
     })
 }
 
-/// HCI packet indicator for events (first byte of a raw-socket datagram).
+/// HCI packet indicators, the first byte of a raw-socket datagram: a command
+/// the host sends, and an event the controller sends back.
 const HCI_COMMAND_PKT: u8 = 0x01;
 const HCI_EVENT_PKT: u8 = 0x04;
 /// Event code for an LE Meta event.
@@ -485,8 +485,8 @@ pub fn parse_hci_packet(buf: &[u8]) -> Vec<AdvReport> {
 /// True if `buf` is framed as an LE advertising-report event (legacy sub-event
 /// `0x02` or extended `0x0D`), regardless of whether its body parses.  Paired
 /// with [`parse_hci_packet`]'s output: an adv-report packet that yields zero
-/// reports is a truncated/malformed report or an AD layout we don't decode —
-/// the signal `telemetry::note_hci_undecoded` counts.  Non-advertising events
+/// reports is a truncated/malformed report or an AD layout we don't decode,
+/// which a caller may want to count.  Non-advertising events
 /// (Command Complete, connection events, …) are *not* adv-report packets, so a
 /// legitimately empty decode of those is never miscounted.
 pub fn is_adv_report_packet(buf: &[u8]) -> bool {
@@ -1420,8 +1420,8 @@ mod tests {
     fn truncated_adv_report_is_the_undecoded_case() {
         // Framed as a legacy advertising report (sub-event 0x02) but the body is
         // truncated, so parse_hci_packet yields nothing while is_adv_report_packet
-        // is true — exactly the combination note_hci_undecoded() counts, and
-        // distinct from a non-advertising event that legitimately decodes empty.
+        // is true: an undecoded report, distinct from a non-advertising event
+        // that legitimately decodes empty.
         let pkt = [0x04, 0x3E, 0x02, 0x02, 0x01];
         assert!(is_adv_report_packet(&pkt));
         assert!(parse_hci_packet(&pkt).is_empty());

@@ -32,6 +32,7 @@ use rustle::client::{DiscoveredCharacteristic, DiscoveredService, GattClient, Ga
 use rustle::conn::{read_rssi, RssiError};
 use rustle::gatt::CCCD_UUID;
 use rustle::l2cap::{L2capAtt, SecurityLevel};
+use rustle::scan_filter::normalize_uuid;
 use std::error::Error;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -84,24 +85,16 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
                 }
             }
             "--listen" => parsed.listen = Duration::from_secs(value.parse()?),
-            "--notify" => parsed.notify = Some(full_uuid(&value)?),
+            "--notify" => {
+                parsed.notify = Some(
+                    normalize_uuid(&value)
+                        .ok_or_else(|| format!("{value} is not a 16, 32 or 128 bit UUID"))?,
+                )
+            }
             _ => return Err(USAGE.into()),
         }
     }
     Ok(parsed)
-}
-
-/// Expand a 16 bit UUID such as `2a37` to the 128 bit form rustle uses, and
-/// lowercase a 128 bit one.
-fn full_uuid(uuid: &str) -> Result<String, String> {
-    let uuid = uuid.to_ascii_lowercase();
-    if uuid.len() == 4 && uuid.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(format!("0000{uuid}-0000-1000-8000-00805f9b34fb"))
-    } else if uuid.len() == 36 {
-        Ok(uuid)
-    } else {
-        Err(format!("{uuid} is not a 16 bit or 128 bit UUID"))
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -258,19 +251,27 @@ fn listen(
 
     let deadline = Instant::now() + duration;
     let (mut values, mut ticks) = (0u32, 0u32);
+    let mut received = Ok(());
     while Instant::now() < deadline {
-        match client.next_event()? {
-            Some((handle, value)) => {
+        match client.next_event() {
+            Ok(Some((handle, value))) => {
                 values += 1;
                 println!("  {handle:#06x}: {}", hex(&value));
             }
             // The one second receive timeout passed with nothing to report.
-            None => ticks += 1,
+            Ok(None) => ticks += 1,
+            Err(e) => {
+                received = Err(e);
+                break;
+            }
         }
     }
     println!(
         "{values} values and {ticks} receive timeouts in {} s",
         duration.as_secs()
     );
-    client.subscribe(cccd.handle, false, false)
+    // Unsubscribe even after a failed read, so the device does not keep the
+    // subscription. A bonded device would remember it.
+    let unsubscribed = client.subscribe(cccd.handle, false, false);
+    received.and(unsubscribed)
 }

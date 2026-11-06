@@ -259,8 +259,6 @@ impl From<CommandError> for RssiError {
 #[cfg(target_os = "linux")]
 pub use linux_impl::{connections, read_rssi};
 
-/// Read the RSSI of an established LE connection. This platform has no raw
-/// HCI socket, so this always fails with [`RssiError::Unsupported`].
 /// List the connections established on an adapter. This platform has no HCI
 /// ioctl interface, so this always fails.
 #[cfg(not(target_os = "linux"))]
@@ -268,6 +266,8 @@ pub fn connections(_dev: u16) -> Result<Vec<ConnInfo>, String> {
     Err("connection listing is only supported on Linux".to_string())
 }
 
+/// Read the RSSI of an established LE connection. This platform has no raw
+/// HCI socket, so this always fails with [`RssiError::Unsupported`].
 #[cfg(not(target_os = "linux"))]
 pub fn read_rssi(_dev: u16, _peer: &str, _recv_timeout: Duration) -> Result<Option<i8>, RssiError> {
     Err(RssiError::Unsupported)

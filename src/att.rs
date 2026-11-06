@@ -7,8 +7,8 @@
 //! layer that interprets the response payloads is in [`crate::gatt`].
 //!
 //! Decoding never panics on attacker-shaped bytes: a truncated or malformed PDU
-//! yields `None` (or, for list responses, the entries decoded before the bad
-//! one).
+//! yields `None`. A list response whose last entry is cut short keeps the
+//! complete entries before it.
 
 use crate::hci::{format_uuid128, format_uuid16};
 
@@ -47,8 +47,9 @@ pub const OP_HANDLE_VALUE_CFM: u8 = 0x1E;
 pub const OP_WRITE_CMD: u8 = 0x52;
 
 // ---------------------------------------------------------------------------
-// ATT error codes carried in an Error Response (Vol 3, Part F, §3.4.1.1). Only
-// the codes the GATT client acts on are named; others are surfaced numerically.
+// ATT error codes carried in an Error Response (Vol 3, Part F, §3.4.1.1), for
+// callers matching on `GattError::Att`. The client itself acts only on Invalid
+// Offset and Attribute Not Found; any other code is surfaced as it arrives.
 // ---------------------------------------------------------------------------
 
 pub const ERR_INVALID_HANDLE: u8 = 0x01;
@@ -144,20 +145,21 @@ pub fn read_blob_req(handle: u16, offset: u16) -> Vec<u8> {
 
 /// Write Request (acknowledged): write `value` to `handle`.
 pub fn write_req(handle: u16, value: &[u8]) -> Vec<u8> {
-    let h = handle.to_le_bytes();
-    let mut pkt = Vec::with_capacity(3 + value.len());
-    pkt.extend_from_slice(&[OP_WRITE_REQ, h[0], h[1]]);
-    pkt.extend_from_slice(value);
-    pkt
+    handle_value_pdu(OP_WRITE_REQ, handle, value)
 }
 
 /// Write Command (unacknowledged): write `value` to `handle`. The server sends
 /// neither a response nor an error, so the PDU layout is the only feedback the
 /// wire gives.
 pub fn write_cmd(handle: u16, value: &[u8]) -> Vec<u8> {
+    handle_value_pdu(OP_WRITE_CMD, handle, value)
+}
+
+/// `opcode`, the little-endian `handle`, then `value`.
+fn handle_value_pdu(opcode: u8, handle: u16, value: &[u8]) -> Vec<u8> {
     let h = handle.to_le_bytes();
     let mut pkt = Vec::with_capacity(3 + value.len());
-    pkt.extend_from_slice(&[OP_WRITE_CMD, h[0], h[1]]);
+    pkt.extend_from_slice(&[opcode, h[0], h[1]]);
     pkt.extend_from_slice(value);
     pkt
 }

@@ -391,8 +391,9 @@ mod driver {
     /// socket; the tests run it on an in-memory transport.
     pub(crate) struct ScanDriver<T: HciIo> {
         io: T,
-        /// Set once `start` has sent an enable command, whether or not it was
-        /// confirmed; cleared by `stop`.
+        /// Set as soon as `start` gets past the pre-clear, whether or not any
+        /// later command was confirmed, since the controller may then be
+        /// scanning; cleared by `stop`.
         scanning: bool,
     }
 

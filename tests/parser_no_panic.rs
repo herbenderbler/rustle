@@ -13,7 +13,7 @@
 //! `cargo fuzz` targets in `fuzz/` search deeper, but they need nightly Rust.
 //! See `fuzz/README.md`.
 
-use rustle::{att, conn, hci, mgmt};
+use rustle::{adapter, att, conn, hci, mgmt};
 
 /// Tiny deterministic PRNG (xorshift64*), so any failure reproduces from the
 /// fixed seed rather than being a heisenbug.
@@ -42,7 +42,6 @@ impl Rng {
 fn feed_all(buf: &[u8]) {
     let _ = hci::parse_hci_packet(buf);
     let _ = hci::parse_ad_structures(buf);
-    let _ = hci::ad_structures(buf).count();
     let _ = hci::parse_le_advertising_report(buf);
     let _ = hci::parse_le_extended_advertising_report(buf);
     let _ = hci::is_adv_report_packet(buf);
@@ -50,6 +49,8 @@ fn feed_all(buf: &[u8]) {
     let _ = hci::parse_command_complete(buf);
     let _ = hci::command_outcome(0x200C, buf);
     let _ = att::parse(buf);
+    let _ = att::uuid_from_le(buf);
+    let _ = adapter::parse_dev_info(buf);
     let _ = conn::parse_read_rssi_complete(buf);
     let _ = conn::read_rssi_outcome(0x0040, buf);
     let _ = conn::parse_conn_info_handle(buf);
