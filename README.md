@@ -66,6 +66,8 @@ The crate also builds on other systems, but only Linux can reach the radio.
 
 ## Documentation
 
+The walkthrough is published at <https://herbenderbler.github.io/rustle/>.
+
 - [INSTALL.md](INSTALL.md) covers setup, permissions and the adapter.
 - [USAGE.md](USAGE.md) is a guide to scanning, connecting and GATT.
 - [ARCHITECTURE.md](ARCHITECTURE.md) describes the modules, the design
