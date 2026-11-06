@@ -85,11 +85,19 @@
 //! which surfaces as [`scan::ScanError::Write`] with
 //! [`std::io::ErrorKind::PermissionDenied`].
 //!
+//! An active scan also needs `CAP_NET_ADMIN`. The kernel reads an active scan
+//! as the start of a device discovery that never ends, which blocks new
+//! discoveries and the kernel's own LE connections on the adapter, so
+//! [`scan::HciScanner`] ends it through [`mgmt`] around every active scan.
+//! Without the capability, starting an active scan fails with
+//! [`scan::ScanError::Discovery`].
+//!
 //! [`scan::HciScanner`] programs the controller directly, without telling the
 //! kernel or `bluetoothd`, and turns off any scan already running on it,
-//! including one the kernel runs for `bluetoothd`. A device discovery in
-//! progress then never finishes. Run the scanner on an adapter nothing else
-//! scans on: stop `bluetoothd`, or give rustle an adapter of its own.
+//! including one the kernel runs for `bluetoothd`. After a passive scan, a
+//! device discovery that was in progress never finishes. Run the scanner on
+//! an adapter nothing else scans on: stop `bluetoothd`, or give rustle an
+//! adapter of its own.
 
 pub mod adapter;
 pub mod att;
@@ -98,6 +106,7 @@ pub mod conn;
 pub mod gatt;
 pub mod hci;
 pub mod l2cap;
+pub mod mgmt;
 pub mod scan;
 pub mod scan_filter;
 pub mod scan_merge;

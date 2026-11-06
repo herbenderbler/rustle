@@ -44,6 +44,7 @@ here as a standalone library.
 | `client` | `GattClient`, generic over an `AttIo` transport (MTU exchange, discovery, read / read-long / write with and without response, notifications) | — |
 | `l2cap` | address helpers, `SecurityLevel` | `L2capAtt`: a connected L2CAP ATT channel implementing `AttIo` |
 | `conn` | Read RSSI and connection-list codecs | `read_rssi()` and `connections()`: RSSI of an established LE connection, and the connections an adapter currently carries |
+| `mgmt` | management command and reply codecs | `end_discovery()`: ends the device discovery the kernel believes an active scan started |
 
 Every module keeps its pure layer separate from its socket layer, so the
 protocol logic is unit-tested on any OS without a radio, and the `GattClient`
@@ -52,10 +53,13 @@ is tested against an in-memory transport.
 ## Platform support
 
 The socket layers are Linux-only (`#[cfg(target_os = "linux")]`) and need
-`CAP_NET_RAW` (or root). The scanner programs the controller directly,
-without telling the kernel or `bluetoothd`, and turns off any scan already
-running on it. Run it on an adapter nothing else scans on: stop
-`bluetoothd`, or give rustle an adapter of its own.
+`CAP_NET_RAW` (or root). Active scans also need `CAP_NET_ADMIN`: the kernel
+reads an active scan as the start of a device discovery, and the scanner
+ends that discovery through the kernel's management interface so it does
+not block the kernel's own connections. The scanner programs the
+controller directly, without telling the kernel or `bluetoothd`, and turns
+off any scan already running on it. Run it on an adapter nothing else
+scans on: stop `bluetoothd`, or give rustle an adapter of its own.
 [INSTALL.md](INSTALL.md) explains what goes wrong otherwise.
 
 On other platforms the crate still builds and the socket types still exist,
