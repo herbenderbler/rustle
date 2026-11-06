@@ -304,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Argument | Meaning |
 |---|---|
-| `local` | Address of the local adapter, or `None` for the default adapter. |
+| `local` | Address of the local adapter, or `None` for the kernel's default, usually `hci0`. With more than one adapter, pass the address of the one you scanned on: `adapter::info(dev)` gives it. |
 | `local_random` | True when the local address is a random address. |
 | `peer` | Address of the device, written as `AA:BB:CC:DD:EE:FF`. |
 | `peer_random` | True when the peer uses a random address. The `addr_type` of its scan report says which. |
@@ -515,9 +515,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Error | Cause | Fix |
 |---|---|---|
-| `ScanError::Socket`, `RssiError::Socket` | The raw socket could not be opened. | Grant `CAP_NET_RAW` or run as root. |
-| `ScanError::Bind`, `RssiError::Bind` | No controller at that index, or it is down. | Check `adapter::enumerate` and bring the adapter up. |
-| `ScanError::Rejected { status: 0x0C, .. }` | Command Disallowed. Another stack holds the adapter. | Stop `bluetoothd`. |
+| `ScanError::Socket`, `RssiError::Socket` | The raw socket could not be opened. The kernel probably has no Bluetooth support. | Use a kernel with Bluetooth. Permissions are not the cause: the socket opens without them. |
+| `ScanError::Bind`, `RssiError::Bind` | No controller at that index. | Check `adapter::enumerate` or `btmgmt info`. |
+| `ScanError::Write` with `PermissionDenied` | The binary lacks `CAP_NET_RAW`. The kernel refuses the scan commands. | Grant `CAP_NET_RAW` or run as root. |
+| `ScanError::Write` with `NetworkDown` | The controller is down. | Bring it up with `btmgmt power on`. |
+| `ScanError::Rejected { status: 0x0C, .. }` | Command Disallowed. The controller refused the command in its current state, for example because something restarted a scan while rustle was setting one up. | Stop `bluetoothd`, or use an adapter nothing else scans on. |
 | `ScanError::NoResponse`, `RssiError::NoResponse` | The controller did not answer within the wait. | Watch `btmon` and reset the adapter. |
 | `Unsupported` from any socket type | The program is not running on Linux. | Only the pure layer is available there. |
 | `GattError::Io` with `TimedOut` or `WouldBlock` | The receive timeout passed during a request. | The peer is slow or gone. Retry, then reconnect. |
@@ -528,12 +530,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Troubleshooting
 
-- **Command Disallowed when starting a scan.** `bluetoothd` holds the
-  adapter. Stop it as [INSTALL.md](INSTALL.md) describes.
-- **Permission denied when opening a socket.** The binary lacks
-  `CAP_NET_RAW`. Run `setcap` again after every rebuild.
-- **Bind fails.** There is no controller at that index, or it is down.
-  `hciconfig` or `btmgmt info` shows the state.
+- **`bluetoothd` stops finding devices after a scan.** Starting a scan
+  turned off the scan behind a discovery `bluetoothd` was running, and the
+  discovery never finishes. New ones fail with `Busy`. Stop it with
+  `btmgmt stop-find`, adding `-l` if that reports Invalid Parameters, or
+  power the adapter off and on. To avoid it, stop `bluetoothd` first, as
+  [INSTALL.md](INSTALL.md) describes.
+- **`Write` fails with `PermissionDenied`.** The binary lacks
+  `CAP_NET_RAW`. The socket opens without it, so the error only shows when
+  the scan starts. Run `setcap` again after every rebuild.
+- **`Write` fails with `NetworkDown`.** The controller is down.
+  `btmgmt info` shows its state, and `btmgmt power on` brings it up.
+- **Bind fails.** There is no controller at that index. `btmgmt info`
+  lists the ones there are.
 - **The scan starts but nothing arrives.** Every read ends in `WouldBlock`.
   Nearby devices may be silent, or the controller may be down. `btmon`
   shows the traffic the kernel sees.

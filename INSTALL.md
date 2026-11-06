@@ -63,19 +63,29 @@ the command again after every build.
 sudo setcap cap_net_raw+ep target/debug/myapp
 ```
 
-Running the program as root works too.
+Running the program as root works too. Without the capability the raw
+socket still opens, but the kernel refuses the scan commands, so the error
+is a `Write` error of kind `PermissionDenied`.
 
 ## Free the adapter
 
-rustle sends scan commands straight to the controller. The kernel lets
-only one host stack drive a controller, and `bluetoothd` is that stack on
-most desktops. While it runs, raw scan commands fail with Command
-Disallowed.
+rustle sends scan commands straight to the controller. Neither the kernel
+nor `bluetoothd`, the Bluetooth daemon on most desktops, is told about
+them, and rustle is not told about theirs.
 
-Stopping the daemon frees the controller. It also disconnects everything
-else on that adapter, such as a mouse or headphones, until the daemon is
-started again. Use a second adapter, such as a USB dongle, if you need
-both at once.
+Starting a scan first turns off any scan already running on the
+controller, including one the kernel runs for `bluetoothd`. The kernel
+does not notice. If that scan belonged to a device discovery, the
+discovery never finishes, and the kernel refuses new ones on that adapter
+until the stuck one is stopped. "Recover a stuck discovery" below shows
+how.
+
+An idle `bluetoothd` does not get in the way, but stopping it is the only
+way to be sure nothing else scans on the adapter. Stopping it also
+disconnects everything else on that adapter, such as a mouse or
+headphones, until the daemon is started again. If you need both at once,
+give rustle an adapter of its own, such as a USB dongle, and do not start
+discoveries on it.
 
 Stop the daemon before scanning:
 
@@ -101,6 +111,25 @@ Start the daemon again when you are done:
 ```bash
 sudo systemctl start bluetooth
 ```
+
+### Recover a stuck discovery
+
+If `bluetoothd` stops finding devices after a rustle scan, and
+`btmgmt find` fails with `Busy`, stop the discovery that rustle's scan
+interrupted:
+
+```bash
+sudo btmgmt --index 0 stop-find
+```
+
+If that fails with `Invalid Parameters`, the discovery looked for Low
+Energy devices only. Add `-l`:
+
+```bash
+sudo btmgmt --index 0 stop-find -l
+```
+
+Powering the adapter off and on also clears it.
 
 ## Check the install
 
