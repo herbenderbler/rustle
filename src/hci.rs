@@ -486,9 +486,9 @@ const HCI_SUBEV_LE_ADVERTISING_REPORT: u8 = 0x02;
 /// LE Meta sub-event code for an Extended Advertising Report (BT5).
 const HCI_SUBEV_LE_EXT_ADVERTISING_REPORT: u8 = 0x0D;
 /// Event code for Command Complete.
-const HCI_EV_CMD_COMPLETE: u8 = 0x0E;
+pub(crate) const HCI_EV_CMD_COMPLETE: u8 = 0x0E;
 /// Event code for Command Status.
-const HCI_EV_CMD_STATUS: u8 = 0x0F;
+pub(crate) const HCI_EV_CMD_STATUS: u8 = 0x0F;
 
 /// Parse a raw HCI datagram read from the socket into advertising reports.
 ///
@@ -535,6 +535,39 @@ pub fn is_adv_report_packet(buf: &[u8]) -> bool {
         )
 }
 
+/// Split an HCI event packet into its event code and parameters. `None` for a
+/// non-event packet, or one whose parameter length overruns the buffer.
+fn event_params(buf: &[u8]) -> Option<(u8, &[u8])> {
+    // [type=0x04][event_code][param_len][params…]
+    let &[HCI_EVENT_PKT, event_code, param_len, ref params @ ..] = buf else {
+        return None;
+    };
+    params
+        .get(..param_len as usize)
+        .map(|params| (event_code, params))
+}
+
+/// Split Command Complete parameters into the answered opcode and the return
+/// parameters that follow it.
+fn command_complete_params(p: &[u8]) -> Option<(u16, &[u8])> {
+    // [num_hci_cmd_pkts][opcode_lo][opcode_hi][return parameters…]
+    let &[_, lo, hi, ref ret @ ..] = p else {
+        return None;
+    };
+    Some((u16::from_le_bytes([lo, hi]), ret))
+}
+
+/// If `buf` is a Command Complete event, return the opcode it answers and its
+/// return parameters, which begin with the status for every command this crate
+/// sends; otherwise `None`. A Command Status event is not a Command Complete:
+/// [`parse_command_event`] accepts either when only the status matters.
+pub fn parse_command_complete(buf: &[u8]) -> Option<(u16, &[u8])> {
+    match event_params(buf)? {
+        (HCI_EV_CMD_COMPLETE, p) => command_complete_params(p),
+        _ => None,
+    }
+}
+
 /// If `buf` is a Command Complete or Command Status event, return its
 /// `(opcode, status)`; otherwise `None`.
 ///
@@ -543,21 +576,29 @@ pub fn is_adv_report_packet(buf: &[u8]) -> bool {
 /// rejects a scan command surfaces a real error instead of a silent "scan
 /// active, no detections".
 pub fn parse_command_event(buf: &[u8]) -> Option<(u16, u8)> {
-    if buf.len() < 3 || buf[0] != HCI_EVENT_PKT {
-        return None;
-    }
-    let event_code = buf[1];
-    let param_len = buf[2] as usize;
-    let params_end = 3 + param_len;
-    if params_end > buf.len() {
-        return None;
-    }
-    let p = &buf[3..params_end];
-    match event_code {
-        // Command Complete: [num_hci_cmd_pkts][opcode_lo][opcode_hi][status][…]
-        HCI_EV_CMD_COMPLETE if p.len() >= 4 => Some((u16::from_le_bytes([p[1], p[2]]), p[3])),
+    match event_params(buf)? {
+        (HCI_EV_CMD_COMPLETE, p) => {
+            let (opcode, ret) = command_complete_params(p)?;
+            Some((opcode, *ret.first()?))
+        }
         // Command Status: [status][num_hci_cmd_pkts][opcode_lo][opcode_hi]
-        HCI_EV_CMD_STATUS if p.len() >= 4 => Some((u16::from_le_bytes([p[2], p[3]]), p[0])),
+        (HCI_EV_CMD_STATUS, &[status, _, lo, hi, ..]) => {
+            Some((u16::from_le_bytes([lo, hi]), status))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `pkt` settles a wait for `opcode`'s Command Complete or Command
+/// Status. `None` keeps waiting: the packet is an advertising report, another
+/// command's event, or not an event at all. `Some(Ok(()))` means the controller
+/// accepted the command (status `0x00`) and `Some(Err(status))` means it
+/// rejected it. This is the pure half of a command exchange; the socket layers
+/// loop on it with a bounded number of reads.
+pub fn command_outcome(opcode: u16, pkt: &[u8]) -> Option<Result<(), u8>> {
+    match parse_command_event(pkt)? {
+        (op, 0x00) if op == opcode => Some(Ok(())),
+        (op, status) if op == opcode => Some(Err(status)),
         _ => None,
     }
 }
@@ -1339,6 +1380,47 @@ mod tests {
         assert_eq!(parse_command_event(&cs), Some((0x200B, 0x0C)));
         // An advertising report is not a command event.
         assert_eq!(parse_command_event(&[0x04, 0x3E, 0x02, 0x02, 0x00]), None);
+    }
+
+    #[test]
+    fn command_complete_splits_opcode_and_return_parameters() {
+        // Read RSSI complete: opcode 0x1405, then status, handle and RSSI.
+        let cc = [0x04u8, 0x0E, 0x07, 0x01, 0x05, 0x14, 0x00, 0x40, 0x00, 0xC4];
+        assert_eq!(parse_command_complete(&cc), Some((0x1405, &cc[6..])));
+        // No return parameters at all is still a Command Complete.
+        assert_eq!(
+            parse_command_complete(&[0x04, 0x0E, 0x03, 0x01, 0x0C, 0x20]),
+            Some((0x200C, &[][..]))
+        );
+        // A Command Status, a header too short for the opcode, and a parameter
+        // length that overruns the buffer are not.
+        assert_eq!(
+            parse_command_complete(&[0x04, 0x0F, 0x04, 0x00, 0x01, 0x0C, 0x20]),
+            None
+        );
+        assert_eq!(
+            parse_command_complete(&[0x04, 0x0E, 0x02, 0x01, 0x0C]),
+            None
+        );
+        assert_eq!(
+            parse_command_complete(&[0x04, 0x0E, 0x09, 0x01, 0x0C, 0x20, 0x00]),
+            None
+        );
+    }
+
+    #[test]
+    fn command_outcome_settles_only_on_the_awaited_opcode() {
+        let accepted = [0x04u8, 0x0E, 0x04, 0x01, 0x0C, 0x20, 0x00];
+        let rejected = [0x04u8, 0x0F, 0x04, 0x0C, 0x01, 0x0C, 0x20];
+        let other = [0x04u8, 0x0E, 0x04, 0x01, 0x0B, 0x20, 0x0C];
+        let report = [0x04u8, 0x3E, 0x02, 0x02, 0x00];
+        assert_eq!(command_outcome(0x200C, &accepted), Some(Ok(())));
+        assert_eq!(command_outcome(0x200C, &rejected), Some(Err(0x0C)));
+        // Another command's event, even a rejection, an advertising report and
+        // an empty read all keep the wait going.
+        assert_eq!(command_outcome(0x200C, &other), None);
+        assert_eq!(command_outcome(0x200C, &report), None);
+        assert_eq!(command_outcome(0x200C, &[]), None);
     }
 
     #[test]

@@ -7,24 +7,20 @@
 //! [`connections`] lists the links an adapter currently carries
 //! (`HCIGETCONNLIST`), answered from kernel state without touching them.
 //!
-//! Split like the rest of the crate: the request and response codecs are pure
-//! and unit-tested on every OS, while the socket layer is Linux-only and needs
-//! `CAP_NET_RAW` (or root). On other platforms [`read_rssi`] returns
-//! [`RssiError::Unsupported`] and [`connections`] fails with an error string.
+//! Split like the rest of the crate: the request and response codecs and the
+//! command exchange behind [`read_rssi`] are pure and unit-tested on every OS,
+//! while the socket layer is Linux-only and needs `CAP_NET_RAW` (or root). On
+//! other platforms [`read_rssi`] returns [`RssiError::Unsupported`] and
+//! [`connections`] fails with an error string.
 
-use crate::hci::format_addr_le;
+use crate::hci::{format_addr_le, parse_command_complete, parse_command_event};
+use crate::hci_io::{await_response, send_command, CommandError, HciIo};
 use std::fmt;
 use std::io;
 use std::time::Duration;
 
 /// HCI Read RSSI (OGF 0x05 Status Parameters, OCF 0x0005).
 pub const OPCODE_READ_RSSI: u16 = 0x1405;
-
-// HCI event framing bytes, as in [`crate::hci`].
-const HCI_EVENT_PKT: u8 = 0x04;
-const HCI_EV_CMD_COMPLETE: u8 = 0x0E;
-#[cfg(target_os = "linux")]
-const HCI_EV_CMD_STATUS: u8 = 0x0F;
 
 // ---------------------------------------------------------------------------
 // `HCIGETCONNINFO` buffer codec (BlueZ ABI). The ioctl takes one buffer that
@@ -135,28 +131,43 @@ pub struct ReadRssiComplete {
 /// any other packet, a truncated event, or a Command Complete for another
 /// opcode.
 pub fn parse_read_rssi_complete(buf: &[u8]) -> Option<ReadRssiComplete> {
-    // [0x04][0x0E][plen][num_hci_cmd_pkts][opcode(2)][status][handle(2)][rssi]
-    if buf.len() < 3 || buf[0] != HCI_EVENT_PKT || buf[1] != HCI_EV_CMD_COMPLETE {
+    // Return parameters: [status][handle(2)][rssi]
+    let (OPCODE_READ_RSSI, &[status, h0, h1, rssi, ..]) = parse_command_complete(buf)? else {
         return None;
-    }
-    let plen = buf[2] as usize;
-    let params = buf.get(3..3 + plen)?;
-    if params.len() < 7 {
-        return None;
-    }
-    if u16::from_le_bytes([params[1], params[2]]) != OPCODE_READ_RSSI {
-        return None;
-    }
-    let rssi_byte = params[6];
+    };
     Some(ReadRssiComplete {
-        status: params[3],
-        handle: u16::from_le_bytes([params[4], params[5]]),
-        rssi: if rssi_byte == 0x7f {
-            None
-        } else {
-            Some(rssi_byte as i8)
-        },
+        status,
+        handle: u16::from_le_bytes([h0, h1]),
+        rssi: (rssi != 0x7f).then_some(rssi as i8),
     })
+}
+
+/// Whether `pkt` settles a Read RSSI on `handle`: `None` to keep waiting,
+/// `Some(Ok(rssi))` for the Command Complete carrying that handle (with `None`
+/// inside for the "not available" sentinel), and `Some(Err(status))` when the
+/// controller rejected the command, either in a Command Complete with a
+/// non-zero status or in a Command Status error, which is how a controller
+/// that does not implement the command answers. A Command Complete for another
+/// handle is skipped.
+pub fn read_rssi_outcome(handle: u16, pkt: &[u8]) -> Option<Result<Option<i8>, u8>> {
+    match parse_read_rssi_complete(pkt) {
+        Some(rsp) if rsp.status != 0 => Some(Err(rsp.status)),
+        Some(rsp) if rsp.handle == handle => Some(Ok(rsp.rssi)),
+        Some(_) => None,
+        None => match parse_command_event(pkt) {
+            Some((OPCODE_READ_RSSI, status)) if status != 0 => Some(Err(status)),
+            _ => None,
+        },
+    }
+}
+
+/// Ask the controller for the RSSI on `handle` over an HCI transport that is
+/// already bound and filtered, and await the answer. This is the command half
+/// of [`read_rssi`], shared with the tests.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn read_rssi_on<T: HciIo>(io: &mut T, handle: u16) -> Result<Option<i8>, RssiError> {
+    send_command(io, OPCODE_READ_RSSI, &handle.to_le_bytes())?;
+    await_response(io, |pkt| read_rssi_outcome(handle, pkt)).map_err(RssiError::from)
 }
 
 /// Why a connection RSSI query failed. The socket stages mirror
@@ -228,6 +239,17 @@ impl std::error::Error for RssiError {
     }
 }
 
+impl From<CommandError> for RssiError {
+    fn from(err: CommandError) -> Self {
+        match err {
+            CommandError::Write(e) => RssiError::Write(e),
+            CommandError::Rejected(status) => RssiError::Rejected { status },
+            CommandError::Io(e) => RssiError::Io(e),
+            CommandError::NoResponse => RssiError::NoResponse,
+        }
+    }
+}
+
 // ===========================================================================
 // Linux-only raw HCI socket
 // ===========================================================================
@@ -252,11 +274,11 @@ pub fn read_rssi(_dev: u16, _peer: &str, _recv_timeout: Duration) -> Result<Opti
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::*;
-    use crate::hci::{build_command, parse_command_event};
+    use crate::hci::{HCI_EV_CMD_COMPLETE, HCI_EV_CMD_STATUS};
     use crate::l2cap::mac_str_to_le;
     use crate::sys::{
-        bind, errno, ioctl, read, set_recv_timeout, setsockopt, socket, write, FdGuard, Timeval,
-        AF_BLUETOOTH, BTPROTO_HCI, EAGAIN, EINTR, SOCK_RAW,
+        bind, errno, ioctl, set_recv_timeout, setsockopt, socket, FdGuard, Timeval, AF_BLUETOOTH,
+        BTPROTO_HCI, SOCK_RAW,
     };
     use std::os::raw::{c_int, c_ulong, c_void};
 
@@ -334,7 +356,7 @@ mod linux_impl {
         if fd < 0 {
             return Err(RssiError::Socket(io::Error::last_os_error()));
         }
-        let _guard = FdGuard(fd);
+        let mut sock = FdGuard(fd);
 
         let addr = SockaddrHci {
             hci_family: AF_BLUETOOTH as u16,
@@ -392,55 +414,9 @@ mod linux_impl {
         }
         let handle = parse_conn_info_handle(&info).ok_or(RssiError::NoResponse)?;
 
-        // Ask the controller for the RSSI on that handle.
-        let cmd = build_command(OPCODE_READ_RSSI, &handle.to_le_bytes());
-        let n = unsafe { write(fd, cmd.as_ptr() as *const c_void, cmd.len()) };
-        if n < 0 {
-            return Err(RssiError::Write(io::Error::last_os_error()));
-        }
-        if n as usize != cmd.len() {
-            return Err(RssiError::Write(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short write to HCI socket",
-            )));
-        }
-
-        // Await the Command Complete, skipping unrelated events. Bounded to a
-        // handful of reads, each limited by the receive timeout.
-        const MAX_WAIT: u32 = 8;
-        let mut buf = [0u8; 512];
-        for _ in 0..MAX_WAIT {
-            let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-            if n == 0 {
-                return Err(RssiError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "controller closed the HCI socket",
-                )));
-            }
-            if n < 0 {
-                let e = unsafe { errno() };
-                if e == EAGAIN || e == EINTR {
-                    continue;
-                }
-                return Err(RssiError::Io(io::Error::from_raw_os_error(e)));
-            }
-            let pkt = &buf[..n as usize];
-            if let Some(rsp) = parse_read_rssi_complete(pkt) {
-                if rsp.status != 0 {
-                    return Err(RssiError::Rejected { status: rsp.status });
-                }
-                if rsp.handle == handle {
-                    return Ok(rsp.rssi);
-                }
-            } else if let Some((op, status)) = parse_command_event(pkt) {
-                // A controller that does not implement the command answers
-                // with a Command Status error instead of a Command Complete.
-                if op == OPCODE_READ_RSSI && status != 0 {
-                    return Err(RssiError::Rejected { status });
-                }
-            }
-        }
-        Err(RssiError::NoResponse)
+        // Ask the controller for the RSSI on that handle. The wait is bounded
+        // to a handful of reads, each limited by the receive timeout.
+        read_rssi_on(&mut sock, handle)
     }
 }
 
@@ -451,6 +427,9 @@ mod linux_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hci::build_command;
+    use crate::hci_io::mock::MockHci;
+    use crate::hci_io::MAX_WAIT;
 
     #[test]
     fn conn_list_request_names_the_adapter_and_capacity() {
@@ -575,6 +554,100 @@ mod tests {
         // Not an event packet at all.
         assert_eq!(parse_read_rssi_complete(&[0x02, 0x00, 0x00]), None);
         assert_eq!(parse_read_rssi_complete(&[]), None);
+    }
+
+    /// A Read RSSI Command Complete carrying `status`, `handle` and `rssi`.
+    fn rssi_complete(status: u8, handle: u16, rssi: u8) -> Vec<u8> {
+        let h = handle.to_le_bytes();
+        vec![0x04, 0x0E, 0x07, 0x01, 0x05, 0x14, status, h[0], h[1], rssi]
+    }
+
+    #[test]
+    fn read_rssi_outcome_waits_for_the_right_handle() {
+        // Another handle's answer, an advertising report and an unrelated
+        // Command Complete all keep the wait going; the matching one ends it.
+        assert_eq!(
+            read_rssi_outcome(0x0040, &rssi_complete(0x00, 0x0041, 0xC4)),
+            None
+        );
+        assert_eq!(
+            read_rssi_outcome(0x0040, &[0x04, 0x3E, 0x02, 0x02, 0x00]),
+            None
+        );
+        assert_eq!(
+            read_rssi_outcome(0x0040, &MockHci::command_complete(0x200C, 0x00)),
+            None
+        );
+        assert_eq!(
+            read_rssi_outcome(0x0040, &rssi_complete(0x00, 0x0040, 0xC4)),
+            Some(Ok(Some(-60)))
+        );
+        assert_eq!(
+            read_rssi_outcome(0x0040, &rssi_complete(0x00, 0x0040, 0x7F)),
+            Some(Ok(None))
+        );
+    }
+
+    #[test]
+    fn read_rssi_outcome_reports_a_rejection_either_way() {
+        // A non-zero status ends the wait whatever handle it names, and so does
+        // a Command Status error. A Command Status with status zero is only a
+        // receipt, so the wait goes on.
+        assert_eq!(
+            read_rssi_outcome(0x0040, &rssi_complete(0x02, 0x0041, 0x00)),
+            Some(Err(0x02))
+        );
+        assert_eq!(
+            read_rssi_outcome(0x0040, &MockHci::command_status(OPCODE_READ_RSSI, 0x01)),
+            Some(Err(0x01))
+        );
+        assert_eq!(
+            read_rssi_outcome(0x0040, &MockHci::command_status(OPCODE_READ_RSSI, 0x00)),
+            None
+        );
+    }
+
+    #[test]
+    fn read_rssi_on_writes_the_command_and_returns_the_answer() {
+        let mut io = MockHci::replaying(vec![
+            rssi_complete(0x00, 0x0041, 0xC0), // another connection's answer
+            rssi_complete(0x00, 0x0040, 0xC4),
+        ]);
+        assert_eq!(read_rssi_on(&mut io, 0x0040).unwrap(), Some(-60));
+        assert_eq!(
+            io.written,
+            vec![build_command(OPCODE_READ_RSSI, &[0x40, 0x00])]
+        );
+        assert_eq!(io.reads, 2);
+    }
+
+    #[test]
+    fn read_rssi_on_maps_exchange_failures() {
+        let mut io = MockHci::replaying(vec![MockHci::command_status(OPCODE_READ_RSSI, 0x01)]);
+        assert!(matches!(
+            read_rssi_on(&mut io, 0x0040),
+            Err(RssiError::Rejected { status: 0x01 })
+        ));
+        let mut io = MockHci::replaying(Vec::new());
+        assert!(matches!(
+            read_rssi_on(&mut io, 0x0040),
+            Err(RssiError::NoResponse)
+        ));
+        assert_eq!(io.reads, MAX_WAIT as usize);
+        let mut io = MockHci::replaying(Vec::new());
+        io.fail_writes = true;
+        assert!(matches!(
+            read_rssi_on(&mut io, 0x0040),
+            Err(RssiError::Write(e)) if e.kind() == io::ErrorKind::PermissionDenied
+        ));
+        let mut io = MockHci::new(vec![Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "closed",
+        ))]);
+        assert!(matches!(
+            read_rssi_on(&mut io, 0x0040),
+            Err(RssiError::Io(_))
+        ));
     }
 
     #[test]

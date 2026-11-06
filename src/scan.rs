@@ -5,7 +5,10 @@
 //!
 //! - **Pure, every platform:** [`ScanParams`] (what to program) and the HCI
 //!   parameter encoders behind it, plus [`ScanError`] / [`ScanStart`]. Unit-
-//!   tested against the Core-spec layouts with no radio.
+//!   tested against the Core-spec layouts with no radio. The programming
+//!   protocol itself (pre-clear, extended with legacy fallback, disable on stop
+//!   and on drop) is a driver over the crate's HCI transport trait, so it is
+//!   tested on an in-memory transport as well.
 //! - **Linux only:** [`HciScanner`], which owns an `AF_BLUETOOTH` raw HCI socket
 //!   bound to one controller. It needs `CAP_NET_RAW` (or root) and a controller
 //!   nothing else scans on: [`HciScanner::start`] turns off any scan already
@@ -315,6 +318,190 @@ pub struct ScanStart {
 }
 
 // ===========================================================================
+// The scan driver: the programming protocol over any HCI transport
+// ===========================================================================
+
+// Off Linux there is no socket to drive this with, but it is still compiled
+// and tested there, so the dead code lint is silenced for that build only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod driver {
+    use super::{
+        extended_enable_params, legacy_enable_params, ScanError, ScanMode, ScanParams, ScanStart,
+        OPCODE_LE_SET_EXT_SCAN_ENABLE, OPCODE_LE_SET_EXT_SCAN_PARAMS, OPCODE_LE_SET_SCAN_ENABLE,
+        OPCODE_LE_SET_SCAN_PARAMS,
+    };
+    use crate::hci_io::{self, CommandError, HciIo};
+    use std::io;
+
+    /// One command as the driver sends it: the opcode and its parameters.
+    type Command = (u16, Vec<u8>);
+
+    /// The extended command set for `params`, in send order.
+    fn extended_commands(params: &ScanParams) -> [Command; 2] {
+        [
+            (OPCODE_LE_SET_EXT_SCAN_PARAMS, params.extended_params()),
+            (
+                OPCODE_LE_SET_EXT_SCAN_ENABLE,
+                extended_enable_params(true).to_vec(),
+            ),
+        ]
+    }
+
+    /// The legacy command set for `params`, in send order.
+    fn legacy_commands(params: &ScanParams) -> [Command; 2] {
+        [
+            (OPCODE_LE_SET_SCAN_PARAMS, params.legacy_params().to_vec()),
+            (
+                OPCODE_LE_SET_SCAN_ENABLE,
+                legacy_enable_params(true).to_vec(),
+            ),
+        ]
+    }
+
+    /// The disables for both command sets. The set not in use ignores its
+    /// disable, so sending both is harmless.
+    fn disable_commands() -> [Command; 2] {
+        [
+            (
+                OPCODE_LE_SET_SCAN_ENABLE,
+                legacy_enable_params(false).to_vec(),
+            ),
+            (
+                OPCODE_LE_SET_EXT_SCAN_ENABLE,
+                extended_enable_params(false).to_vec(),
+            ),
+        ]
+    }
+
+    impl ScanError {
+        /// A failed command exchange, with the opcode it was for.
+        fn from_command(opcode: u16, err: CommandError) -> Self {
+            match err {
+                CommandError::Write(e) => ScanError::Write(e),
+                CommandError::Rejected(status) => ScanError::Rejected { opcode, status },
+                CommandError::Io(e) => ScanError::Io(e),
+                CommandError::NoResponse => ScanError::NoResponse,
+            }
+        }
+    }
+
+    /// The scan programming protocol over an [`HciIo`] transport: pre-clear
+    /// both command sets, program the extended set with a legacy fallback, and
+    /// disable on stop and on drop. The Linux scanner runs it on a raw HCI
+    /// socket; the tests run it on an in-memory transport.
+    pub(crate) struct ScanDriver<T: HciIo> {
+        io: T,
+        /// Set once `start` has sent an enable command, whether or not it was
+        /// confirmed; cleared by `stop`.
+        scanning: bool,
+    }
+
+    impl<T: HciIo> ScanDriver<T> {
+        pub(crate) fn new(io: T) -> Self {
+            ScanDriver {
+                io,
+                scanning: false,
+            }
+        }
+
+        /// Program and enable scanning: pre-clear, then the extended set, then
+        /// the legacy set if the controller rejected the extended one and a
+        /// legacy scan still covers the request.
+        pub(crate) fn start(&mut self, params: ScanParams) -> Result<ScanStart, ScanError> {
+            // Best-effort pre-clear: the status of a disable is uninteresting.
+            self.disable();
+            // From here on the controller may be scanning even if this call
+            // fails. An enable can be accepted while its completion event is
+            // lost under a flood of queued reports, so `stop` and Drop must
+            // send the disables regardless of the outcome.
+            self.scanning = true;
+            match self.program(&extended_commands(&params)) {
+                Ok(()) => Ok(ScanStart {
+                    mode: ScanMode::Extended,
+                    fallback: None,
+                }),
+                // A Coded-only request has no legacy equivalent: a 1M legacy
+                // scan would listen on the wrong PHY, so the rejection is
+                // surfaced instead of narrowing the request.
+                Err(ext_err) if !params.phys.legacy_fallback_covers() => Err(ext_err),
+                Err(ext_err) => {
+                    self.program(&legacy_commands(&params))?;
+                    Ok(ScanStart {
+                        mode: ScanMode::Legacy,
+                        fallback: Some(ext_err),
+                    })
+                }
+            }
+        }
+
+        /// Disable scanning if `start` was attempted, in both command sets,
+        /// and wait for the controller to confirm each. The driver's own
+        /// transport can hold a backlog of advertising reports ahead of a
+        /// completion, long enough to exhaust the bounded wait, so each
+        /// disable goes out on a transport `confirm` opens, which should
+        /// deliver command completions only. When `confirm` cannot open one,
+        /// that disable goes out unconfirmed on the driver's own transport.
+        ///
+        /// Nothing is reported: a rejection is the command set the scan did
+        /// not use, and any other failure means the controller is gone.
+        /// Idempotent.
+        pub(crate) fn stop<C: HciIo>(&mut self, mut confirm: impl FnMut() -> Option<C>) {
+            if !std::mem::take(&mut self.scanning) {
+                return;
+            }
+            for (opcode, params) in disable_commands() {
+                match confirm() {
+                    Some(mut io) => {
+                        let _ = hci_io::command(&mut io, opcode, &params);
+                    }
+                    None => {
+                        let _ = hci_io::send_command(&mut self.io, opcode, &params);
+                    }
+                }
+            }
+        }
+
+        /// Read one HCI datagram into `buf`.
+        pub(crate) fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.io.read_packet(buf)
+        }
+
+        /// Send one command and wait for the controller to accept it.
+        pub(crate) fn command(&mut self, opcode: u16, params: &[u8]) -> Result<(), ScanError> {
+            hci_io::command(&mut self.io, opcode, params)
+                .map_err(|err| ScanError::from_command(opcode, err))
+        }
+
+        /// Send each command in turn, stopping at the first the controller does
+        /// not accept.
+        fn program(&mut self, commands: &[Command]) -> Result<(), ScanError> {
+            commands
+                .iter()
+                .try_for_each(|(opcode, params)| self.command(*opcode, params))
+        }
+
+        /// Send both disables without waiting for their completion events.
+        fn disable(&mut self) {
+            for (opcode, params) in disable_commands() {
+                // Best effort: there is nothing to do about a failed disable.
+                let _ = hci_io::send_command(&mut self.io, opcode, &params);
+            }
+        }
+    }
+
+    /// The owner normally stops the driver first, confirming the disables.
+    /// If it did not, they still go out, unconfirmed, before the transport
+    /// closes.
+    impl<T: HciIo> Drop for ScanDriver<T> {
+        fn drop(&mut self) {
+            if std::mem::take(&mut self.scanning) {
+                self.disable();
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Linux-only raw HCI socket
 // ===========================================================================
 
@@ -323,12 +510,12 @@ pub use linux_impl::HciScanner;
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
+    use super::driver::ScanDriver;
     use super::*;
-    use crate::hci::{build_command, parse_command_event};
     use crate::mgmt;
     use crate::sys::{
-        bind, close, read, set_recv_timeout, setsockopt, socket, write, FdGuard, Timeval,
-        AF_BLUETOOTH, BTPROTO_HCI, SOCK_RAW,
+        bind, set_recv_timeout, setsockopt, socket, FdGuard, Timeval, AF_BLUETOOTH, BTPROTO_HCI,
+        SOCK_RAW,
     };
     use std::os::raw::{c_int, c_void};
     use std::time::Duration;
@@ -341,7 +528,7 @@ mod linux_impl {
 
     /// Bound on each wait for the management interface's answer.
     const MGMT_TIMEOUT: Duration = Duration::from_secs(2);
-    /// Receive timeout of the socket [`HciScanner::stop`] confirms the
+    /// Receive timeout of the sockets [`HciScanner::stop`] confirms the
     /// disables on.
     const CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -372,20 +559,20 @@ mod linux_impl {
     /// after its handle goes away. A drop cannot report errors; call
     /// [`HciScanner::stop`] first to see them.
     pub struct HciScanner {
-        fd: c_int,
         dev: u16,
-        /// Set once [`HciScanner::start`] has sent an enable command, whether or
-        /// not it was confirmed; cleared by [`HciScanner::stop`].
-        scanning: bool,
-        /// Set when that scan was active, so [`HciScanner::stop`] ends the
-        /// discovery the kernel then believes is running.
+        /// The scan protocol over the socket. The socket lives inside the
+        /// driver, so it is still open while [`HciScanner::stop`] runs on
+        /// drop, and closes after.
+        driver: ScanDriver<FdGuard>,
+        /// Set when [`HciScanner::start`] programmed an active scan, so
+        /// [`HciScanner::stop`] ends the discovery the kernel then believes
+        /// is running.
         active: bool,
     }
 
     impl Drop for HciScanner {
         fn drop(&mut self) {
             let _ = self.stop();
-            unsafe { close(self.fd) };
         }
     }
 
@@ -446,84 +633,6 @@ mod linux_impl {
         Ok(guard)
     }
 
-    /// Read one datagram from `fd`; see [`HciScanner::read`].
-    fn read_fd(fd: c_int, buf: &mut [u8]) -> io::Result<usize> {
-        let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if n > 0 {
-            Ok(n as usize)
-        } else if n == 0 {
-            Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "controller closed the HCI socket",
-            ))
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    /// Write one HCI command without waiting for its completion event. The
-    /// kernel checks permissions and the controller's state at this point,
-    /// so its refusal comes back here as the `write()` error.
-    fn write_fd(fd: c_int, opcode: u16, params: &[u8]) -> io::Result<()> {
-        let pkt = build_command(opcode, params);
-        let n = unsafe { write(fd, pkt.as_ptr() as *const c_void, pkt.len()) };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else if n as usize != pkt.len() {
-            Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short write to HCI socket",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Wait on `fd` for the Command Complete or Command Status answering
-    /// `opcode`; `Ok(())` only if the controller accepted the command
-    /// (status `0x00`). Other events are skipped. Bounded to a handful of
-    /// reads, each limited by the socket's receive timeout.
-    fn await_command(fd: c_int, opcode: u16) -> Result<(), ScanError> {
-        const MAX_WAIT: u32 = 8;
-        let mut buf = [0u8; 512];
-        for _ in 0..MAX_WAIT {
-            match read_fd(fd, &mut buf) {
-                Ok(n) => {
-                    if let Some((op, status)) = parse_command_event(&buf[..n]) {
-                        if op == opcode {
-                            return if status == 0 {
-                                Ok(())
-                            } else {
-                                Err(ScanError::Rejected { opcode, status })
-                            };
-                        }
-                    }
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue;
-                }
-                Err(e) => return Err(ScanError::Io(e)),
-            }
-        }
-        Err(ScanError::NoResponse)
-    }
-
-    /// Send one command on a socket of its own that receives only command
-    /// completions, and wait for the answer. The scanner's own socket can
-    /// hold a backlog of advertising reports ahead of the completion, long
-    /// enough to exhaust the bounded wait.
-    fn confirmed_command(dev: u16, opcode: u16, params: &[u8]) -> Result<(), ScanError> {
-        let mask = (1 << HCI_EV_CMD_COMPLETE) | (1 << HCI_EV_CMD_STATUS);
-        let guard = open_raw(dev, [mask, 0], CONFIRM_TIMEOUT)?;
-        write_fd(guard.0, opcode, params).map_err(ScanError::Write)?;
-        await_command(guard.0, opcode)
-    }
-
     impl HciScanner {
         /// Open a raw HCI socket bound to controller index `dev` (`hciN` → `N`),
         /// filtered to deliver every HCI event, with `recv_timeout` applied as
@@ -533,12 +642,9 @@ mod linux_impl {
         /// timeout and makes reads block indefinitely.
         pub fn open(dev: u16, recv_timeout: Duration) -> Result<Self, ScanError> {
             let guard = open_raw(dev, [0xffff_ffff, 0xffff_ffff], recv_timeout)?;
-            let fd = guard.0;
-            std::mem::forget(guard); // success — ownership moves to HciScanner
             Ok(HciScanner {
-                fd,
                 dev,
-                scanning: false,
+                driver: ScanDriver::new(guard),
                 active: false,
             })
         }
@@ -578,57 +684,10 @@ mod linux_impl {
                 // discovery cleanly instead of cutting its scan off.
                 mgmt::end_discovery(self.dev, MGMT_TIMEOUT).map_err(ScanError::Discovery)?;
             }
-
-            // Best-effort pre-clear: the outcome of a disable is uninteresting,
-            // and a write that fails here fails again, reported, below.
-            let _ = write_fd(
-                self.fd,
-                OPCODE_LE_SET_SCAN_ENABLE,
-                &legacy_enable_params(false),
-            );
-            let _ = write_fd(
-                self.fd,
-                OPCODE_LE_SET_EXT_SCAN_ENABLE,
-                &extended_enable_params(false),
-            );
-            // From here on the controller may be scanning even if this call
-            // fails — an enable can be accepted while its completion event is
-            // lost under a flood of queued reports — so `stop()` / Drop must
-            // send the disables regardless of the outcome.
-            self.scanning = true;
             // A passive restart must not forget an earlier active scan whose
             // discovery stop() still has to end.
             self.active |= active;
-            let start = match self.start_extended(&params) {
-                Ok(()) => ScanStart {
-                    mode: ScanMode::Extended,
-                    fallback: None,
-                },
-                Err(ext_err) => {
-                    // A Coded-only request has no legacy equivalent: a 1M
-                    // legacy scan would listen on the wrong PHY, so the
-                    // rejection is surfaced instead of narrowing the request.
-                    if !params.phys.legacy_fallback_covers() {
-                        return Err(ext_err);
-                    }
-                    self.start_legacy(&params)?;
-                    ScanStart {
-                        mode: ScanMode::Legacy,
-                        fallback: Some(ext_err),
-                    }
-                }
-            };
-            Ok(start)
-        }
-
-        fn start_extended(&mut self, params: &ScanParams) -> Result<(), ScanError> {
-            self.command(OPCODE_LE_SET_EXT_SCAN_PARAMS, &params.extended_params())?;
-            self.command(OPCODE_LE_SET_EXT_SCAN_ENABLE, &extended_enable_params(true))
-        }
-
-        fn start_legacy(&mut self, params: &ScanParams) -> Result<(), ScanError> {
-            self.command(OPCODE_LE_SET_SCAN_PARAMS, &params.legacy_params())?;
-            self.command(OPCODE_LE_SET_SCAN_ENABLE, &legacy_enable_params(true))
+            self.driver.start(params)
         }
 
         /// Disable scanning if [`HciScanner::start`] was attempted, in both
@@ -644,31 +703,12 @@ mod linux_impl {
         /// `btmgmt stop-find` or a power cycle. Drop calls this too but
         /// cannot report errors.
         pub fn stop(&mut self) -> Result<(), ScanError> {
-            if !self.scanning {
-                return Ok(());
-            }
-            self.scanning = false;
-
-            let legacy = legacy_enable_params(false);
-            let extended = extended_enable_params(false);
-            for (opcode, params) in [
-                (OPCODE_LE_SET_SCAN_ENABLE, &legacy[..]),
-                (OPCODE_LE_SET_EXT_SCAN_ENABLE, &extended[..]),
-            ] {
-                // A rejection is the command set the scan did not use, and
-                // a write or read error means the controller is gone. Only
-                // when there is no socket to confirm on is the disable still
-                // owed: send it unconfirmed.
-                if let Err(
-                    ScanError::Socket(_)
-                    | ScanError::Bind(_)
-                    | ScanError::Filter(_)
-                    | ScanError::RecvTimeout(_),
-                ) = confirmed_command(self.dev, opcode, params)
-                {
-                    let _ = write_fd(self.fd, opcode, params);
-                }
-            }
+            // Each disable is confirmed on a socket that receives only
+            // command completions.
+            let dev = self.dev;
+            let completions = (1 << HCI_EV_CMD_COMPLETE) | (1 << HCI_EV_CMD_STATUS);
+            self.driver
+                .stop(|| open_raw(dev, [completions, 0], CONFIRM_TIMEOUT).ok());
 
             if std::mem::take(&mut self.active) {
                 mgmt::end_discovery(self.dev, MGMT_TIMEOUT).map_err(ScanError::Discovery)?;
@@ -685,7 +725,7 @@ mod linux_impl {
         /// controller closed the socket; anything else is a real socket error
         /// (the adapter was unplugged, reset or rfkill'd).
         pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            read_fd(self.fd, buf)
+            self.driver.read(buf)
         }
 
         /// Send one HCI command and wait for its Command Complete / Command
@@ -695,8 +735,7 @@ mod linux_impl {
         /// by the receive timeout, so a controller that never answers can't
         /// hang the caller.
         pub fn command(&mut self, opcode: u16, params: &[u8]) -> Result<(), ScanError> {
-            write_fd(self.fd, opcode, params).map_err(ScanError::Write)?;
-            await_command(self.fd, opcode)
+            self.driver.command(opcode, params)
         }
     }
 }
@@ -755,7 +794,11 @@ mod other_impl {
 
 #[cfg(test)]
 mod tests {
+    use super::driver::ScanDriver;
     use super::*;
+    use crate::hci::build_command;
+    use crate::hci_io::mock::MockHci;
+    use crate::hci_io::MAX_WAIT;
 
     #[test]
     fn default_is_a_passive_scan_from_the_public_address() {
@@ -895,6 +938,238 @@ mod tests {
             "controller rejected command 0x2041 (status 0x01)"
         );
         assert!(ScanError::Unsupported.to_string().contains("Linux"));
+    }
+
+    // The driver over an in-memory transport. The transport is lent to the
+    // driver so it can be inspected after the driver is dropped.
+
+    fn accepted(opcode: u16) -> Vec<u8> {
+        MockHci::command_complete(opcode, 0x00)
+    }
+
+    /// The two disables sent before a start and again on stop.
+    const DISABLES: [u16; 2] = [OPCODE_LE_SET_SCAN_ENABLE, OPCODE_LE_SET_EXT_SCAN_ENABLE];
+
+    #[test]
+    fn driver_pre_clears_both_sets_then_programs_the_extended_set() {
+        let mut io = MockHci::replaying(vec![
+            accepted(OPCODE_LE_SET_EXT_SCAN_PARAMS),
+            accepted(OPCODE_LE_SET_EXT_SCAN_ENABLE),
+        ]);
+        let mut driver = ScanDriver::new(&mut io);
+        let start = driver.start(ScanParams::default()).unwrap();
+        assert_eq!(start.mode, ScanMode::Extended);
+        assert!(start.fallback.is_none());
+        drop(driver);
+        assert_eq!(
+            io.written_opcodes(),
+            vec![
+                OPCODE_LE_SET_SCAN_ENABLE,     // pre-clear, legacy
+                OPCODE_LE_SET_EXT_SCAN_ENABLE, // pre-clear, extended
+                OPCODE_LE_SET_EXT_SCAN_PARAMS,
+                OPCODE_LE_SET_EXT_SCAN_ENABLE,
+                OPCODE_LE_SET_SCAN_ENABLE,     // stop on drop, legacy
+                OPCODE_LE_SET_EXT_SCAN_ENABLE, // stop on drop, extended
+            ]
+        );
+        // The bytes are the pure encoders' output, framed by `build_command`.
+        assert_eq!(
+            io.written[0],
+            build_command(OPCODE_LE_SET_SCAN_ENABLE, &legacy_enable_params(false))
+        );
+        assert_eq!(
+            io.written[2],
+            build_command(
+                OPCODE_LE_SET_EXT_SCAN_PARAMS,
+                &ScanParams::default().extended_params()
+            )
+        );
+        assert_eq!(
+            io.written[3],
+            build_command(OPCODE_LE_SET_EXT_SCAN_ENABLE, &extended_enable_params(true))
+        );
+    }
+
+    #[test]
+    fn driver_falls_back_to_the_legacy_set_when_extended_is_rejected() {
+        let mut io = MockHci::replaying(vec![
+            MockHci::command_status(OPCODE_LE_SET_EXT_SCAN_PARAMS, 0x01),
+            accepted(OPCODE_LE_SET_SCAN_PARAMS),
+            accepted(OPCODE_LE_SET_SCAN_ENABLE),
+        ]);
+        let mut driver = ScanDriver::new(&mut io);
+        let start = driver.start(ScanParams::default()).unwrap();
+        assert_eq!(start.mode, ScanMode::Legacy);
+        assert!(matches!(
+            start.fallback,
+            Some(ScanError::Rejected {
+                opcode: OPCODE_LE_SET_EXT_SCAN_PARAMS,
+                status: 0x01
+            })
+        ));
+        drop(driver);
+        assert_eq!(
+            io.written_opcodes()[2..5],
+            [
+                OPCODE_LE_SET_EXT_SCAN_PARAMS,
+                OPCODE_LE_SET_SCAN_PARAMS,
+                OPCODE_LE_SET_SCAN_ENABLE
+            ]
+        );
+        assert_eq!(
+            io.written[3],
+            build_command(
+                OPCODE_LE_SET_SCAN_PARAMS,
+                &ScanParams::default().legacy_params()
+            )
+        );
+    }
+
+    #[test]
+    fn driver_does_not_fall_back_for_a_coded_only_request() {
+        let mut io = MockHci::replaying(vec![MockHci::command_status(
+            OPCODE_LE_SET_EXT_SCAN_PARAMS,
+            0x01,
+        )]);
+        let params = ScanParams {
+            phys: ScanPhys::Coded,
+            ..ScanParams::default()
+        };
+        let mut driver = ScanDriver::new(&mut io);
+        assert!(matches!(
+            driver.start(params),
+            Err(ScanError::Rejected {
+                opcode: OPCODE_LE_SET_EXT_SCAN_PARAMS,
+                status: 0x01
+            })
+        ));
+        drop(driver);
+        let opcodes = io.written_opcodes();
+        assert!(!opcodes.contains(&OPCODE_LE_SET_SCAN_PARAMS));
+        // The attempt may have left the controller scanning, so the drop still
+        // sends the disables.
+        assert_eq!(opcodes[opcodes.len() - 2..], DISABLES);
+    }
+
+    #[test]
+    fn driver_disables_on_drop_after_a_start_that_got_no_answer() {
+        let mut io = MockHci::replaying(Vec::new());
+        let mut driver = ScanDriver::new(&mut io);
+        assert!(matches!(
+            driver.start(ScanParams::default()),
+            Err(ScanError::NoResponse)
+        ));
+        drop(driver);
+        // The pre-clear, the extended parameters that got no answer, the
+        // legacy parameters tried next that got none either, then the disables
+        // on drop.
+        assert_eq!(
+            io.written_opcodes(),
+            vec![
+                OPCODE_LE_SET_SCAN_ENABLE,
+                OPCODE_LE_SET_EXT_SCAN_ENABLE,
+                OPCODE_LE_SET_EXT_SCAN_PARAMS,
+                OPCODE_LE_SET_SCAN_PARAMS,
+                OPCODE_LE_SET_SCAN_ENABLE,
+                OPCODE_LE_SET_EXT_SCAN_ENABLE,
+            ]
+        );
+    }
+
+    /// A `confirm` for [`ScanDriver::stop`] that can never open a transport.
+    fn unconfirmed() -> Option<MockHci> {
+        None
+    }
+
+    #[test]
+    fn driver_stop_confirms_each_disable_on_a_transport_of_its_own() {
+        let mut io = MockHci::replaying(vec![
+            accepted(OPCODE_LE_SET_EXT_SCAN_PARAMS),
+            accepted(OPCODE_LE_SET_EXT_SCAN_ENABLE),
+        ]);
+        // The legacy disable is accepted. The extended one is rejected, as a
+        // controller without the extended set does, which is not an error.
+        let mut confirms = [
+            MockHci::replaying(vec![accepted(OPCODE_LE_SET_SCAN_ENABLE)]),
+            MockHci::replaying(vec![MockHci::command_status(
+                OPCODE_LE_SET_EXT_SCAN_ENABLE,
+                0x01,
+            )]),
+        ];
+        let mut driver = ScanDriver::new(&mut io);
+        driver.start(ScanParams::default()).unwrap();
+        let mut lent = confirms.iter_mut();
+        driver.stop(|| lent.next());
+        driver.stop(unconfirmed);
+        drop(driver);
+        // The driver's own transport carried only the pre-clear and the
+        // programming; the second stop and the drop add nothing.
+        assert_eq!(io.written.len(), 4);
+        for (confirm, opcode) in confirms.iter().zip(DISABLES) {
+            assert_eq!(confirm.written_opcodes(), [opcode]);
+            assert_eq!(confirm.reads, 1);
+        }
+        assert_eq!(
+            confirms[0].written[0],
+            build_command(OPCODE_LE_SET_SCAN_ENABLE, &legacy_enable_params(false))
+        );
+    }
+
+    #[test]
+    fn driver_stop_sends_the_disables_itself_when_it_cannot_confirm() {
+        let mut io = MockHci::replaying(vec![
+            accepted(OPCODE_LE_SET_EXT_SCAN_PARAMS),
+            accepted(OPCODE_LE_SET_EXT_SCAN_ENABLE),
+        ]);
+        let mut driver = ScanDriver::new(&mut io);
+        driver.start(ScanParams::default()).unwrap();
+        driver.stop(unconfirmed);
+        driver.stop(unconfirmed);
+        drop(driver);
+        // Two for the pre-clear, two to program, two for the first stop. The
+        // second stop and the drop add nothing.
+        assert_eq!(io.written.len(), 6);
+        assert_eq!(io.written_opcodes()[4..], DISABLES);
+    }
+
+    #[test]
+    fn driver_sends_nothing_on_drop_without_a_start() {
+        let mut io = MockHci::replaying(Vec::new());
+        drop(ScanDriver::new(&mut io));
+        assert!(io.written.is_empty());
+    }
+
+    #[test]
+    fn driver_command_maps_exchange_failures_with_the_opcode() {
+        let opcode = OPCODE_LE_SET_SCAN_PARAMS;
+        let mut io = MockHci::replaying(vec![MockHci::command_complete(opcode, 0x0C)]);
+        assert!(matches!(
+            ScanDriver::new(&mut io).command(opcode, &[]),
+            Err(ScanError::Rejected {
+                opcode: OPCODE_LE_SET_SCAN_PARAMS,
+                status: 0x0C
+            })
+        ));
+        let mut io = MockHci::replaying(Vec::new());
+        assert!(matches!(
+            ScanDriver::new(&mut io).command(opcode, &[]),
+            Err(ScanError::NoResponse)
+        ));
+        assert_eq!(io.reads, MAX_WAIT as usize);
+        let mut io = MockHci::replaying(Vec::new());
+        io.fail_writes = true;
+        assert!(matches!(
+            ScanDriver::new(&mut io).command(opcode, &[]),
+            Err(ScanError::Write(e)) if e.kind() == io::ErrorKind::PermissionDenied
+        ));
+        let mut io = MockHci::new(vec![Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "closed",
+        ))]);
+        assert!(matches!(
+            ScanDriver::new(&mut io).command(opcode, &[]),
+            Err(ScanError::Io(_))
+        ));
     }
 
     #[test]

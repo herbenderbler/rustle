@@ -46,8 +46,11 @@ fn feed_all(buf: &[u8]) {
     let _ = hci::parse_le_extended_advertising_report(buf);
     let _ = hci::is_adv_report_packet(buf);
     let _ = hci::parse_command_event(buf);
+    let _ = hci::parse_command_complete(buf);
+    let _ = hci::command_outcome(0x200C, buf);
     let _ = att::parse(buf);
     let _ = conn::parse_read_rssi_complete(buf);
+    let _ = conn::read_rssi_outcome(0x0040, buf);
     let _ = conn::parse_conn_info_handle(buf);
     let _ = conn::parse_conn_list(buf);
     let _ = mgmt::parse_command_reply(buf);
