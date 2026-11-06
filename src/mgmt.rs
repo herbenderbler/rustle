@@ -288,25 +288,11 @@ pub fn end_discovery(_dev: u16, _timeout: Duration) -> Result<DiscoveryEnd, Mgmt
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::*;
-    use crate::sys::{
-        bind, read, set_recv_timeout, socket, write, FdGuard, Timeval, AF_BLUETOOTH, BTPROTO_HCI,
-        SOCK_RAW,
-    };
-    use std::os::raw::{c_int, c_void};
+    use crate::sys::{Socket, HCI_CHANNEL_CONTROL, HCI_DEV_NONE};
     use std::time::Instant;
-
-    const HCI_DEV_NONE: u16 = 0xFFFF;
-    const HCI_CHANNEL_CONTROL: u16 = 3;
 
     /// How long each read waits, so the deadline is checked often.
     const READ_TICK: Duration = Duration::from_millis(200);
-
-    #[repr(C)]
-    struct SockaddrHci {
-        hci_family: u16,
-        hci_dev: u16,
-        hci_channel: u16,
-    }
 
     /// End any device discovery the kernel believes is running on
     /// controller `dev` (`hciN` → `N`), trying each of [`DISCOVERY_TYPES`]
@@ -316,34 +302,15 @@ mod linux_impl {
     /// Needs `CAP_NET_ADMIN`: without it the kernel answers
     /// [`STATUS_PERMISSION_DENIED`], reported as [`MgmtError::Refused`].
     pub fn end_discovery(dev: u16, timeout: Duration) -> Result<DiscoveryEnd, MgmtError> {
-        let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
-        if fd < 0 {
-            return Err(MgmtError::Socket(io::Error::last_os_error()));
-        }
-        let guard = FdGuard(fd);
-
-        let addr = SockaddrHci {
-            hci_family: AF_BLUETOOTH as u16,
-            hci_dev: HCI_DEV_NONE,
-            hci_channel: HCI_CHANNEL_CONTROL,
-        };
-        let rc = unsafe {
-            bind(
-                fd,
-                &addr as *const SockaddrHci as *const c_void,
-                std::mem::size_of::<SockaddrHci>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(MgmtError::Bind(io::Error::last_os_error()));
-        }
-        if set_recv_timeout(fd, &Timeval::from_duration(READ_TICK)) < 0 {
-            return Err(MgmtError::RecvTimeout(io::Error::last_os_error()));
-        }
+        let sock = Socket::hci().map_err(MgmtError::Socket)?;
+        sock.bind_hci(HCI_DEV_NONE, HCI_CHANNEL_CONTROL)
+            .map_err(MgmtError::Bind)?;
+        sock.set_recv_timeout(READ_TICK)
+            .map_err(MgmtError::RecvTimeout)?;
 
         for address_type in DISCOVERY_TYPES {
             let cmd = stop_discovery_command(dev, address_type);
-            let status = request(guard.0, dev, OP_STOP_DISCOVERY, &cmd, timeout)?;
+            let status = request(&sock, dev, OP_STOP_DISCOVERY, &cmd, timeout)?;
             match classify_stop(status) {
                 StopOutcome::Stopped => return Ok(DiscoveryEnd::Stopped(address_type)),
                 StopOutcome::NotRunning => return Ok(DiscoveryEnd::NotRunning),
@@ -364,7 +331,7 @@ mod linux_impl {
     /// also receives Device Found and the like) are skipped until
     /// `timeout` passes.
     fn request(
-        fd: c_int,
+        sock: &Socket,
         dev: u16,
         opcode: u16,
         cmd: &[u8],
@@ -375,32 +342,30 @@ mod linux_impl {
         // Index, Invalid Parameters), it queues that status as the reply and
         // write() returns 0; a command that runs returns its full length.
         // Either way the reply is read below.
-        let n = unsafe { write(fd, cmd.as_ptr() as *const c_void, cmd.len()) };
-        if n < 0 {
-            return Err(MgmtError::Write(io::Error::last_os_error()));
-        }
+        sock.write(cmd).map_err(MgmtError::Write)?;
 
         let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 1024];
         while Instant::now() < deadline {
-            let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-            if n == 0 {
-                return Err(MgmtError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "management socket closed",
-                )));
-            }
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) {
-                    continue;
+            let n = match sock.read(&mut buf) {
+                Ok(0) => {
+                    return Err(MgmtError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "management socket closed",
+                    )))
                 }
-                return Err(MgmtError::Io(e));
-            }
-            if let Some(reply) = parse_command_reply(&buf[..n as usize]) {
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(MgmtError::Io(e)),
+            };
+            if let Some(reply) = parse_command_reply(&buf[..n]) {
                 if reply.index == dev && reply.opcode == opcode {
                     return Ok(reply.status);
                 }

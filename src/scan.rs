@@ -512,44 +512,16 @@ pub use linux_impl::HciScanner;
 mod linux_impl {
     use super::driver::ScanDriver;
     use super::*;
+    use crate::hci::{HCI_EV_CMD_COMPLETE, HCI_EV_CMD_STATUS};
     use crate::mgmt;
-    use crate::sys::{
-        bind, set_recv_timeout, setsockopt, socket, FdGuard, Timeval, AF_BLUETOOTH, BTPROTO_HCI,
-        SOCK_RAW,
-    };
-    use std::os::raw::{c_int, c_void};
+    use crate::sys::{Socket, HCI_CHANNEL_RAW};
     use std::time::Duration;
-
-    const HCI_CHANNEL_RAW: u16 = 0;
-    const SOL_HCI: c_int = 0;
-    const HCI_FILTER: c_int = 2;
-    const HCI_EV_CMD_COMPLETE: u32 = 0x0E;
-    const HCI_EV_CMD_STATUS: u32 = 0x0F;
 
     /// Bound on each wait for the management interface's answer.
     const MGMT_TIMEOUT: Duration = Duration::from_secs(2);
     /// Receive timeout of the sockets [`HciScanner::stop`] confirms the
     /// disables on.
     const CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
-
-    #[repr(C)]
-    struct SockaddrHci {
-        hci_family: u16,
-        hci_dev: u16,
-        hci_channel: u16,
-    }
-
-    #[repr(C)]
-    struct HciFilter {
-        type_mask: u32,
-        event_mask: [u32; 2],
-        opcode: u16,
-        // The struct is 16 bytes (align 4) but the fields above end at offset 14,
-        // so this explicit trailing pad keeps the two padding bytes handed to
-        // setsockopt (via `size_of`) initialized rather than crossing the FFI
-        // boundary uninitialized. Layout/size are unchanged.
-        _pad: u16,
-    }
 
     /// A raw HCI socket bound to one controller, programmed for LE scanning.
     ///
@@ -563,7 +535,7 @@ mod linux_impl {
         /// The scan protocol over the socket. The socket lives inside the
         /// driver, so it is still open while [`HciScanner::stop`] runs on
         /// drop, and closes after.
-        driver: ScanDriver<FdGuard>,
+        driver: ScanDriver<Socket>,
         /// Set when [`HciScanner::start`] programmed an active scan, so
         /// [`HciScanner::stop`] ends the discovery the kernel then believes
         /// is running.
@@ -582,55 +554,15 @@ mod linux_impl {
         dev: u16,
         event_mask: [u32; 2],
         recv_timeout: Duration,
-    ) -> Result<FdGuard, ScanError> {
-        let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
-        if fd < 0 {
-            return Err(ScanError::Socket(io::Error::last_os_error()));
-        }
-        let guard = FdGuard(fd);
-
-        let addr = SockaddrHci {
-            hci_family: AF_BLUETOOTH as u16,
-            hci_dev: dev,
-            hci_channel: HCI_CHANNEL_RAW,
-        };
-        let rc = unsafe {
-            bind(
-                fd,
-                &addr as *const SockaddrHci as *const c_void,
-                std::mem::size_of::<SockaddrHci>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(ScanError::Bind(io::Error::last_os_error()));
-        }
-
-        // type_mask bit 4 selects event packets (HCI_EVENT_PKT); event_mask
-        // selects the event codes, one bit each.
-        let filter = HciFilter {
-            type_mask: 1 << 4,
-            event_mask,
-            opcode: 0,
-            _pad: 0,
-        };
-        let rc = unsafe {
-            setsockopt(
-                fd,
-                SOL_HCI,
-                HCI_FILTER,
-                &filter as *const HciFilter as *const c_void,
-                std::mem::size_of::<HciFilter>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(ScanError::Filter(io::Error::last_os_error()));
-        }
-
-        let rc = set_recv_timeout(fd, &Timeval::from_duration(recv_timeout));
-        if rc < 0 {
-            return Err(ScanError::RecvTimeout(io::Error::last_os_error()));
-        }
-        Ok(guard)
+    ) -> Result<Socket, ScanError> {
+        let sock = Socket::hci().map_err(ScanError::Socket)?;
+        sock.bind_hci(dev, HCI_CHANNEL_RAW)
+            .map_err(ScanError::Bind)?;
+        sock.set_hci_event_filter(event_mask)
+            .map_err(ScanError::Filter)?;
+        sock.set_recv_timeout(recv_timeout)
+            .map_err(ScanError::RecvTimeout)?;
+        Ok(sock)
     }
 
     impl HciScanner {
@@ -641,10 +573,10 @@ mod linux_impl {
         /// read loop can poll a shutdown flag). `Duration::ZERO` disables the
         /// timeout and makes reads block indefinitely.
         pub fn open(dev: u16, recv_timeout: Duration) -> Result<Self, ScanError> {
-            let guard = open_raw(dev, [0xffff_ffff, 0xffff_ffff], recv_timeout)?;
+            let sock = open_raw(dev, [0xffff_ffff, 0xffff_ffff], recv_timeout)?;
             Ok(HciScanner {
                 dev,
-                driver: ScanDriver::new(guard),
+                driver: ScanDriver::new(sock),
                 active: false,
             })
         }
@@ -706,7 +638,7 @@ mod linux_impl {
             // Each disable is confirmed on a socket that receives only
             // command completions.
             let dev = self.dev;
-            let completions = (1 << HCI_EV_CMD_COMPLETE) | (1 << HCI_EV_CMD_STATUS);
+            let completions = (1u32 << HCI_EV_CMD_COMPLETE) | (1u32 << HCI_EV_CMD_STATUS);
             self.driver
                 .stop(|| open_raw(dev, [completions, 0], CONFIRM_TIMEOUT).ok());
 
