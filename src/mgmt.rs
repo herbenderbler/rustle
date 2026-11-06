@@ -314,7 +314,8 @@ mod linux_impl {
             match classify_stop(status) {
                 StopOutcome::Stopped => return Ok(DiscoveryEnd::Stopped(address_type)),
                 StopOutcome::NotRunning => return Ok(DiscoveryEnd::NotRunning),
-                StopOutcome::WrongType => continue,
+                // Not the type that is running: try the next one.
+                StopOutcome::WrongType => {}
                 StopOutcome::Refused => {
                     return Err(MgmtError::Refused {
                         opcode: OP_STOP_DISCOVERY,
