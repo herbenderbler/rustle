@@ -11,8 +11,11 @@
 //!   tested on an in-memory transport as well.
 //! - **Linux only:** [`HciScanner`], which owns an `AF_BLUETOOTH` raw HCI socket
 //!   bound to one controller. It needs `CAP_NET_RAW` (or root) and a controller
-//!   that `bluetoothd` is not holding. On other platforms the type exists but
-//!   [`HciScanner::open`] returns [`ScanError::Unsupported`].
+//!   nothing else scans on: [`HciScanner::start`] turns off any scan already
+//!   running, including one the kernel runs for `bluetoothd`. An active scan
+//!   also needs `CAP_NET_ADMIN`, to end the discovery the kernel believes it
+//!   starts (see [`HciScanner::start`]). On other platforms the type exists
+//!   but [`HciScanner::open`] returns [`ScanError::Unsupported`].
 //!
 //! The scanner is deliberately policy-free: it hands back raw HCI datagrams.
 //! Feed each one to [`crate::hci::parse_hci_packet`] for the decoded reports
@@ -27,6 +30,10 @@
 //! own address, and [`OwnAddrType`] selects whether that is the public
 //! (hardware) address or the random address previously set on the controller.
 //! [`ScanParams::default`] is passive.
+//!
+//! The kernel reads an active scan as the start of a device discovery, so an
+//! active scan needs `CAP_NET_ADMIN` as well, for [`crate::mgmt`] to end that
+//! discovery again. A passive scan needs only `CAP_NET_RAW`.
 //!
 //! # Extended vs legacy
 //!
@@ -229,26 +236,37 @@ pub enum ScanMode {
     Legacy,
 }
 
-/// Why opening the socket or talking to the controller failed. The `open`
-/// stages are distinguished so a caller can give a precise hint (permissions
-/// vs. a missing adapter).
+/// Why opening the socket or talking to the controller failed. The stages are
+/// distinguished so a caller can give a precise hint: a missing adapter fails
+/// at [`ScanError::Bind`], while missing permissions and a powered-off adapter
+/// only show at the first command, as [`ScanError::Write`].
 #[derive(Debug)]
 pub enum ScanError {
-    /// `socket()` failed — usually missing `CAP_NET_RAW` / not root.
+    /// `socket()` failed, typically because the kernel has no Bluetooth
+    /// support. The raw HCI socket opens without `CAP_NET_RAW`.
     Socket(io::Error),
-    /// `bind()` to the controller index failed — the adapter is absent or down.
+    /// `bind()` to the controller index failed: there is no controller at that
+    /// index. Binding succeeds for a controller that is down.
     Bind(io::Error),
     /// Setting the HCI event filter failed; without it no events are delivered.
     Filter(io::Error),
     /// Setting the receive timeout failed.
     RecvTimeout(io::Error),
-    /// An HCI command could not be written in full.
-    ShortWrite,
+    /// An HCI command could not be written. The kernel refuses the scan
+    /// commands with [`io::ErrorKind::PermissionDenied`] when the process
+    /// lacks `CAP_NET_RAW`, and every command with
+    /// [`io::ErrorKind::NetworkDown`] when the controller is down. A partial
+    /// write is [`io::ErrorKind::WriteZero`].
+    Write(io::Error),
     /// The controller answered a command with a non-zero status (`0x01` =
     /// Unknown HCI Command, `0x0C` = Command Disallowed, …).
     Rejected { opcode: u16, status: u8 },
     /// A read error while waiting for a command's completion event.
     Io(io::Error),
+    /// Ending the kernel's record of a discovery failed, around an active
+    /// scan; see [`HciScanner::start`]. [`crate::mgmt::MgmtError::is_permission_denied`]
+    /// means the process lacks `CAP_NET_ADMIN`, which active scans need.
+    Discovery(crate::mgmt::MgmtError),
     /// No Command Complete / Command Status event arrived for the command
     /// within the bounded wait.
     NoResponse,
@@ -263,12 +281,13 @@ impl fmt::Display for ScanError {
             ScanError::Bind(e) => write!(f, "cannot bind controller ({e})"),
             ScanError::Filter(e) => write!(f, "cannot set HCI event filter ({e})"),
             ScanError::RecvTimeout(e) => write!(f, "cannot set receive timeout ({e})"),
-            ScanError::ShortWrite => write!(f, "short write to HCI socket"),
+            ScanError::Write(e) => write!(f, "cannot write HCI command ({e})"),
             ScanError::Rejected { opcode, status } => write!(
                 f,
                 "controller rejected command 0x{opcode:04x} (status 0x{status:02x})"
             ),
             ScanError::Io(e) => write!(f, "read error awaiting command response ({e})"),
+            ScanError::Discovery(e) => write!(f, "cannot end the kernel's discovery: {e}"),
             ScanError::NoResponse => write!(f, "no Command Complete/Status from controller"),
             ScanError::Unsupported => write!(f, "raw HCI scanning is only supported on Linux"),
         }
@@ -282,7 +301,9 @@ impl std::error::Error for ScanError {
             | ScanError::Bind(e)
             | ScanError::Filter(e)
             | ScanError::RecvTimeout(e)
+            | ScanError::Write(e)
             | ScanError::Io(e) => Some(e),
+            ScanError::Discovery(e) => Some(e),
             _ => None,
         }
     }
@@ -356,7 +377,7 @@ mod driver {
         /// A failed command exchange, with the opcode it was for.
         fn from_command(opcode: u16, err: CommandError) -> Self {
             match err {
-                CommandError::ShortWrite => ScanError::ShortWrite,
+                CommandError::Write(e) => ScanError::Write(e),
                 CommandError::Rejected(status) => ScanError::Rejected { opcode, status },
                 CommandError::Io(e) => ScanError::Io(e),
                 CommandError::NoResponse => ScanError::NoResponse,
@@ -413,12 +434,30 @@ mod driver {
             }
         }
 
-        /// Disable scanning if `start` was attempted, in both command sets.
-        /// Idempotent, and also run on drop.
-        pub(crate) fn stop(&mut self) {
-            if self.scanning {
-                self.disable();
-                self.scanning = false;
+        /// Disable scanning if `start` was attempted, in both command sets,
+        /// and wait for the controller to confirm each. The driver's own
+        /// transport can hold a backlog of advertising reports ahead of a
+        /// completion, long enough to exhaust the bounded wait, so each
+        /// disable goes out on a transport `confirm` opens, which should
+        /// deliver command completions only. When `confirm` cannot open one,
+        /// that disable goes out unconfirmed on the driver's own transport.
+        ///
+        /// Nothing is reported: a rejection is the command set the scan did
+        /// not use, and any other failure means the controller is gone.
+        /// Idempotent.
+        pub(crate) fn stop<C: HciIo>(&mut self, mut confirm: impl FnMut() -> Option<C>) {
+            if !std::mem::take(&mut self.scanning) {
+                return;
+            }
+            for (opcode, params) in disable_commands() {
+                match confirm() {
+                    Some(mut io) => {
+                        let _ = hci_io::command(&mut io, opcode, &params);
+                    }
+                    None => {
+                        let _ = hci_io::send_command(&mut self.io, opcode, &params);
+                    }
+                }
             }
         }
 
@@ -450,9 +489,14 @@ mod driver {
         }
     }
 
+    /// The owner normally stops the driver first, confirming the disables.
+    /// If it did not, they still go out, unconfirmed, before the transport
+    /// closes.
     impl<T: HciIo> Drop for ScanDriver<T> {
         fn drop(&mut self) {
-            self.stop();
+            if std::mem::take(&mut self.scanning) {
+                self.disable();
+            }
         }
     }
 }
@@ -468,6 +512,7 @@ pub use linux_impl::HciScanner;
 mod linux_impl {
     use super::driver::ScanDriver;
     use super::*;
+    use crate::mgmt;
     use crate::sys::{
         bind, set_recv_timeout, setsockopt, socket, FdGuard, Timeval, AF_BLUETOOTH, BTPROTO_HCI,
         SOCK_RAW,
@@ -478,6 +523,14 @@ mod linux_impl {
     const HCI_CHANNEL_RAW: u16 = 0;
     const SOL_HCI: c_int = 0;
     const HCI_FILTER: c_int = 2;
+    const HCI_EV_CMD_COMPLETE: u32 = 0x0E;
+    const HCI_EV_CMD_STATUS: u32 = 0x0F;
+
+    /// Bound on each wait for the management interface's answer.
+    const MGMT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Receive timeout of the sockets [`HciScanner::stop`] confirms the
+    /// disables on.
+    const CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 
     #[repr(C)]
     struct SockaddrHci {
@@ -501,14 +554,83 @@ mod linux_impl {
     /// A raw HCI socket bound to one controller, programmed for LE scanning.
     ///
     /// Dropping the scanner stops any scan it may have started (best-effort,
-    /// in both command sets) and closes the socket, so a controller is never
-    /// left scanning after its handle goes away.
+    /// in both command sets), ends the kernel's discovery after an active
+    /// scan, and closes the socket, so a controller is never left scanning
+    /// after its handle goes away. A drop cannot report errors; call
+    /// [`HciScanner::stop`] first to see them.
     pub struct HciScanner {
         dev: u16,
         /// The scan protocol over the socket. The socket lives inside the
-        /// driver, so the disables the driver sends on drop go out before the
-        /// descriptor closes.
+        /// driver, so it is still open while [`HciScanner::stop`] runs on
+        /// drop, and closes after.
         driver: ScanDriver<FdGuard>,
+        /// Set when [`HciScanner::start`] programmed an active scan, so
+        /// [`HciScanner::stop`] ends the discovery the kernel then believes
+        /// is running.
+        active: bool,
+    }
+
+    impl Drop for HciScanner {
+        fn drop(&mut self) {
+            let _ = self.stop();
+        }
+    }
+
+    /// Open a raw HCI socket bound to controller `dev`, delivering the HCI
+    /// events `event_mask` selects, with `recv_timeout` as `SO_RCVTIMEO`.
+    fn open_raw(
+        dev: u16,
+        event_mask: [u32; 2],
+        recv_timeout: Duration,
+    ) -> Result<FdGuard, ScanError> {
+        let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
+        if fd < 0 {
+            return Err(ScanError::Socket(io::Error::last_os_error()));
+        }
+        let guard = FdGuard(fd);
+
+        let addr = SockaddrHci {
+            hci_family: AF_BLUETOOTH as u16,
+            hci_dev: dev,
+            hci_channel: HCI_CHANNEL_RAW,
+        };
+        let rc = unsafe {
+            bind(
+                fd,
+                &addr as *const SockaddrHci as *const c_void,
+                std::mem::size_of::<SockaddrHci>() as u32,
+            )
+        };
+        if rc < 0 {
+            return Err(ScanError::Bind(io::Error::last_os_error()));
+        }
+
+        // type_mask bit 4 selects event packets (HCI_EVENT_PKT); event_mask
+        // selects the event codes, one bit each.
+        let filter = HciFilter {
+            type_mask: 1 << 4,
+            event_mask,
+            opcode: 0,
+            _pad: 0,
+        };
+        let rc = unsafe {
+            setsockopt(
+                fd,
+                SOL_HCI,
+                HCI_FILTER,
+                &filter as *const HciFilter as *const c_void,
+                std::mem::size_of::<HciFilter>() as u32,
+            )
+        };
+        if rc < 0 {
+            return Err(ScanError::Filter(io::Error::last_os_error()));
+        }
+
+        let rc = set_recv_timeout(fd, &Timeval::from_duration(recv_timeout));
+        if rc < 0 {
+            return Err(ScanError::RecvTimeout(io::Error::last_os_error()));
+        }
+        Ok(guard)
     }
 
     impl HciScanner {
@@ -519,57 +641,11 @@ mod linux_impl {
         /// read loop can poll a shutdown flag). `Duration::ZERO` disables the
         /// timeout and makes reads block indefinitely.
         pub fn open(dev: u16, recv_timeout: Duration) -> Result<Self, ScanError> {
-            let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
-            if fd < 0 {
-                return Err(ScanError::Socket(io::Error::last_os_error()));
-            }
-            let guard = FdGuard(fd);
-
-            let addr = SockaddrHci {
-                hci_family: AF_BLUETOOTH as u16,
-                hci_dev: dev,
-                hci_channel: HCI_CHANNEL_RAW,
-            };
-            let rc = unsafe {
-                bind(
-                    fd,
-                    &addr as *const SockaddrHci as *const c_void,
-                    std::mem::size_of::<SockaddrHci>() as u32,
-                )
-            };
-            if rc < 0 {
-                return Err(ScanError::Bind(io::Error::last_os_error()));
-            }
-
-            // Receive all event packets (type_mask bit for HCI_EVENT_PKT = 1<<4),
-            // every event code (event_mask all ones).
-            let filter = HciFilter {
-                type_mask: 1 << 4,
-                event_mask: [0xffff_ffff, 0xffff_ffff],
-                opcode: 0,
-                _pad: 0,
-            };
-            let rc = unsafe {
-                setsockopt(
-                    fd,
-                    SOL_HCI,
-                    HCI_FILTER,
-                    &filter as *const HciFilter as *const c_void,
-                    std::mem::size_of::<HciFilter>() as u32,
-                )
-            };
-            if rc < 0 {
-                return Err(ScanError::Filter(io::Error::last_os_error()));
-            }
-
-            let rc = set_recv_timeout(fd, &Timeval::from_duration(recv_timeout));
-            if rc < 0 {
-                return Err(ScanError::RecvTimeout(io::Error::last_os_error()));
-            }
-
+            let guard = open_raw(dev, [0xffff_ffff, 0xffff_ffff], recv_timeout)?;
             Ok(HciScanner {
                 dev,
                 driver: ScanDriver::new(guard),
+                active: false,
             })
         }
 
@@ -579,22 +655,65 @@ mod linux_impl {
         }
 
         /// Program and enable scanning. Any scan already in progress (in either
-        /// command set) is disabled first. The extended command set is tried
-        /// first; if the controller rejects it the legacy set is programmed
-        /// instead and the rejection is reported as [`ScanStart::fallback`].
-        /// An error means neither set could be *confirmed* enabled (typically
-        /// another process owns the controller); the scanner still sends the
-        /// disables on [`HciScanner::stop`] / drop, in case an enable was
-        /// accepted but its completion event lost.
+        /// command set) is disabled first, which recovers a controller left
+        /// scanning by a process that died before its scanner was dropped.
+        ///
+        /// The kernel takes an active scan for the start of a device
+        /// discovery, and once the scan is disabled that discovery never ends:
+        /// it blocks new discoveries and the kernel's own LE connections on
+        /// the adapter (see [`crate::mgmt`]). So for an active scan, `start`
+        /// first ends any discovery in progress, and [`HciScanner::stop`] ends
+        /// the one the scan starts. Both need `CAP_NET_ADMIN`; without it
+        /// `start` fails with [`ScanError::Discovery`] before touching the
+        /// controller. A passive scan needs neither, but it still stops a scan
+        /// the kernel runs for `bluetoothd`, and a discovery in progress then
+        /// never finishes: stop `bluetoothd` first.
+        ///
+        /// The extended command set is tried first; if the controller rejects
+        /// it the legacy set is programmed instead and the rejection is
+        /// reported as [`ScanStart::fallback`]. An error means neither set
+        /// could be *confirmed* enabled: a command could not be written
+        /// ([`ScanError::Write`]) or the controller refused it. The scanner
+        /// still sends the disables on [`HciScanner::stop`] / drop, in case an
+        /// enable was accepted but its completion event lost.
         pub fn start(&mut self, params: ScanParams) -> Result<ScanStart, ScanError> {
+            let active = params.scan_type == ScanType::Active;
+            if active {
+                // Fails fast when CAP_NET_ADMIN is missing, before the scan
+                // could leave the kernel's discovery stuck, and ends a real
+                // discovery cleanly instead of cutting its scan off.
+                mgmt::end_discovery(self.dev, MGMT_TIMEOUT).map_err(ScanError::Discovery)?;
+            }
+            // A passive restart must not forget an earlier active scan whose
+            // discovery stop() still has to end.
+            self.active |= active;
             self.driver.start(params)
         }
 
-        /// Disable scanning if [`HciScanner::start`] was attempted (best-effort,
-        /// in both command sets — the unused one is a harmless no-op). Also run
-        /// on drop; calling it explicitly just makes the stop point visible.
-        pub fn stop(&mut self) {
-            self.driver.stop()
+        /// Disable scanning if [`HciScanner::start`] was attempted, in both
+        /// command sets (the unused one is a harmless no-op), and wait for the
+        /// controller to confirm each. After an active scan, then end the
+        /// discovery the kernel believes the scan started. The order matters:
+        /// a Stop Discovery that arrives while the kernel still thinks the
+        /// scan is on makes the kernel disable it too, and if that fails the
+        /// discovery stays stuck.
+        ///
+        /// An error is a [`ScanError::Discovery`]: the scan is off, but new
+        /// discoveries and LE connections on the adapter stay blocked until
+        /// `btmgmt stop-find` or a power cycle. Drop calls this too but
+        /// cannot report errors.
+        pub fn stop(&mut self) -> Result<(), ScanError> {
+            // Each disable is confirmed on a socket that receives only
+            // command completions.
+            let dev = self.dev;
+            let completions = (1 << HCI_EV_CMD_COMPLETE) | (1 << HCI_EV_CMD_STATUS);
+            self.driver
+                .stop(|| open_raw(dev, [completions, 0], CONFIRM_TIMEOUT).ok());
+
+            if std::mem::take(&mut self.active) {
+                mgmt::end_discovery(self.dev, MGMT_TIMEOUT).map_err(ScanError::Discovery)?;
+            }
+            Ok(())
         }
 
         /// Read one HCI datagram into `buf`, returning its length (always > 0).
@@ -655,7 +774,7 @@ mod other_impl {
             match self.0 {}
         }
 
-        pub fn stop(&mut self) {
+        pub fn stop(&mut self) -> Result<(), ScanError> {
             match self.0 {}
         }
 
@@ -957,16 +1076,55 @@ mod tests {
         );
     }
 
+    /// A `confirm` for [`ScanDriver::stop`] that can never open a transport.
+    fn unconfirmed() -> Option<MockHci> {
+        None
+    }
+
     #[test]
-    fn driver_stop_sends_the_disables_once() {
+    fn driver_stop_confirms_each_disable_on_a_transport_of_its_own() {
+        let mut io = MockHci::replaying(vec![
+            accepted(OPCODE_LE_SET_EXT_SCAN_PARAMS),
+            accepted(OPCODE_LE_SET_EXT_SCAN_ENABLE),
+        ]);
+        // The legacy disable is accepted. The extended one is rejected, as a
+        // controller without the extended set does, which is not an error.
+        let mut confirms = [
+            MockHci::replaying(vec![accepted(OPCODE_LE_SET_SCAN_ENABLE)]),
+            MockHci::replaying(vec![MockHci::command_status(
+                OPCODE_LE_SET_EXT_SCAN_ENABLE,
+                0x01,
+            )]),
+        ];
+        let mut driver = ScanDriver::new(&mut io);
+        driver.start(ScanParams::default()).unwrap();
+        let mut lent = confirms.iter_mut();
+        driver.stop(|| lent.next());
+        driver.stop(unconfirmed);
+        drop(driver);
+        // The driver's own transport carried only the pre-clear and the
+        // programming; the second stop and the drop add nothing.
+        assert_eq!(io.written.len(), 4);
+        for (confirm, opcode) in confirms.iter().zip(DISABLES) {
+            assert_eq!(confirm.written_opcodes(), [opcode]);
+            assert_eq!(confirm.reads, 1);
+        }
+        assert_eq!(
+            confirms[0].written[0],
+            build_command(OPCODE_LE_SET_SCAN_ENABLE, &legacy_enable_params(false))
+        );
+    }
+
+    #[test]
+    fn driver_stop_sends_the_disables_itself_when_it_cannot_confirm() {
         let mut io = MockHci::replaying(vec![
             accepted(OPCODE_LE_SET_EXT_SCAN_PARAMS),
             accepted(OPCODE_LE_SET_EXT_SCAN_ENABLE),
         ]);
         let mut driver = ScanDriver::new(&mut io);
         driver.start(ScanParams::default()).unwrap();
-        driver.stop();
-        driver.stop();
+        driver.stop(unconfirmed);
+        driver.stop(unconfirmed);
         drop(driver);
         // Two for the pre-clear, two to program, two for the first stop. The
         // second stop and the drop add nothing.
@@ -1002,7 +1160,7 @@ mod tests {
         io.fail_writes = true;
         assert!(matches!(
             ScanDriver::new(&mut io).command(opcode, &[]),
-            Err(ScanError::ShortWrite)
+            Err(ScanError::Write(e)) if e.kind() == io::ErrorKind::PermissionDenied
         ));
         let mut io = MockHci::new(vec![Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -1012,6 +1170,29 @@ mod tests {
             ScanDriver::new(&mut io).command(opcode, &[]),
             Err(ScanError::Io(_))
         ));
+    }
+
+    #[test]
+    fn discovery_error_says_which_capability_is_missing() {
+        use std::error::Error as _;
+        let e = ScanError::Discovery(crate::mgmt::MgmtError::Refused {
+            opcode: crate::mgmt::OP_STOP_DISCOVERY,
+            status: crate::mgmt::STATUS_PERMISSION_DENIED,
+        });
+        assert!(e.to_string().ends_with("it needs CAP_NET_ADMIN"));
+        assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn write_error_keeps_the_kernel_error() {
+        use std::error::Error as _;
+        let e = ScanError::Write(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(e.to_string().starts_with("cannot write HCI command"));
+        let source = e.source().and_then(|s| s.downcast_ref::<io::Error>());
+        assert_eq!(
+            source.map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied)
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

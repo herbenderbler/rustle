@@ -56,26 +56,49 @@ The tests pass on any OS. Only a Linux build can talk to hardware.
 ## Grant socket permissions
 
 The raw HCI socket and the L2CAP socket need the `CAP_NET_RAW` capability.
-Give it to the binary that uses rustle. A rebuild writes a new file, so run
-the command again after every build.
+An active scan, such as the one `examples/battery.rs` runs to find a device
+by name, also needs `CAP_NET_ADMIN`; "Free the adapter" below explains why.
+Give the capabilities to the binary that uses rustle. A rebuild writes a
+new file, so run the command again after every build.
 
 ```bash
-sudo setcap cap_net_raw+ep target/debug/myapp
+sudo setcap cap_net_raw,cap_net_admin+ep target/debug/myapp
 ```
 
-Running the program as root works too.
+A program that only scans passively needs just `cap_net_raw`. Running the
+program as root works too.
+
+Without `CAP_NET_RAW` the raw socket still opens, but the kernel refuses
+the scan commands, so the error is a `Write` error of kind
+`PermissionDenied`. Without `CAP_NET_ADMIN`, an active scan fails before it
+starts, with a `Discovery` error that names the capability.
 
 ## Free the adapter
 
-rustle sends scan commands straight to the controller. The kernel lets
-only one host stack drive a controller, and `bluetoothd` is that stack on
-most desktops. While it runs, raw scan commands fail with Command
-Disallowed.
+rustle sends scan commands straight to the controller. Neither the kernel
+nor `bluetoothd`, the Bluetooth daemon on most desktops, is told about
+them, and rustle is not told about theirs.
 
-Stopping the daemon frees the controller. It also disconnects everything
-else on that adapter, such as a mouse or headphones, until the daemon is
-started again. Use a second adapter, such as a USB dongle, if you need
-both at once.
+Starting a scan first turns off any scan already running on the
+controller, including one the kernel runs for `bluetoothd`. The kernel
+does not notice. If that scan belonged to a device discovery, the
+discovery never finishes, and the kernel refuses new ones on that adapter
+until the stuck one is stopped. An active scan avoids this by ending any
+discovery cleanly before it starts; a passive scan does not.
+
+The kernel also reads each of rustle's active scans as a device discovery
+of its own. Until that discovery ends, the kernel refuses new ones and
+does not make LE connections on the adapter, so rustle ends it when the
+scan stops. That is why active scans need `CAP_NET_ADMIN`. A program
+killed before it could stop its scan leaves the discovery running.
+"Recover a stuck discovery" below shows how to end one by hand.
+
+An idle `bluetoothd` does not get in the way, but stopping it is the only
+way to be sure nothing else scans on the adapter. Stopping it also
+disconnects everything else on that adapter, such as a mouse or
+headphones, until the daemon is started again. If you need both at once,
+give rustle an adapter of its own, such as a USB dongle, and do not start
+discoveries on it.
 
 Stop the daemon before scanning:
 
@@ -102,6 +125,27 @@ Start the daemon again when you are done:
 sudo systemctl start bluetooth
 ```
 
+### Recover a stuck discovery
+
+If `btmgmt find` fails with `Busy` on an adapter rustle scanned on, a
+discovery is stuck: one a passive scan cut off, or one an active scan
+left behind because its program was killed before it could stop. Until it
+ends, `bluetoothd` finds no devices there and connections on that adapter
+time out. Stop it:
+
+```bash
+sudo btmgmt --index 0 stop-find
+```
+
+If that fails with `Invalid Parameters`, the discovery looked for Low
+Energy devices only. Add `-l`:
+
+```bash
+sudo btmgmt --index 0 stop-find -l
+```
+
+Powering the adapter off and on also clears it.
+
 ## Check the install
 
 Build the example scanner, grant it the capability and run it. It listens
@@ -123,16 +167,22 @@ Each line shows an address, the RSSI and the local name when the device
 sends one. A summary line gives the report count at the end. Pass another
 interface name or another number of seconds as needed.
 
-To go one step further, build `examples/battery.rs` the same way and run
-it with the start of a nearby device's name. It connects to the device
-and reads its battery level. [USAGE.md](USAGE.md) explains each step.
+To go one step further, build `examples/battery.rs` the same way, grant
+it `cap_net_raw,cap_net_admin+ep` for its active scan, and run it with the
+start of a nearby device's name. It connects to the device and reads its
+battery level. [USAGE.md](USAGE.md) explains each step.
 
 ## Test in a container
 
-The repository's `Dockerfile` builds rustle and both examples on the latest
+The repository's `Dockerfile` builds rustle and its examples on the latest
 Ubuntu LTS, with the BlueZ tools installed. It is a quick way to try the
 examples against a real adapter without touching the toolchain on the
-machine. Build the image from the repository root:
+machine.
+
+Run the container with Docker Engine on the Linux machine the adapter is
+plugged into. Docker Desktop, on any operating system, runs containers in
+a virtual machine with no Bluetooth, so the examples and `btmgmt` cannot
+reach an adapter there. Build the image from the repository root:
 
 ```bash
 docker build -t rustle .
@@ -140,9 +190,12 @@ docker build -t rustle .
 
 The container needs three things to reach a controller. Bluetooth sockets
 belong to the network namespace, so it must share the machine's with
-`--net=host`. `NET_RAW` opens the raw sockets. `NET_ADMIN` lets `btmgmt`
-power the adapter on. The machine's `bluetoothd` still owns the controller
-from inside the container, so stop it first, as described above.
+`--net=host`. `NET_RAW` is the capability from "Grant socket permissions"
+above. Docker grants it to every container by default, and the flag keeps
+the command working under runtimes that do not. `NET_ADMIN` lets `btmgmt`
+power the adapter on and lets an active scan end the kernel's discovery,
+as "Free the adapter" explains. The machine's `bluetoothd` still runs
+beside the container, so stop it first, as described above.
 
 ```bash
 docker run --rm -it --net=host --cap-add=NET_RAW --cap-add=NET_ADMIN rustle

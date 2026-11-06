@@ -40,8 +40,9 @@ impl<T: HciIo + ?Sized> HciIo for &mut T {
 /// error type, adding the context it has, such as the opcode.
 #[derive(Debug)]
 pub(crate) enum CommandError {
-    /// The command could not be written in full.
-    ShortWrite,
+    /// The command could not be written. The [`io::Error`] carries the
+    /// kernel's reason; a partial write is [`io::ErrorKind::WriteZero`].
+    Write(io::Error),
     /// The controller answered with this non-zero status.
     Rejected(u8),
     /// A read error while awaiting the response.
@@ -66,7 +67,7 @@ pub(crate) fn send_command<T: HciIo>(
     params: &[u8],
 ) -> Result<(), CommandError> {
     io.write_packet(&build_command(opcode, params))
-        .map_err(|_| CommandError::ShortWrite)
+        .map_err(CommandError::Write)
 }
 
 /// Read packets until `settle` says one of them answers the outstanding
@@ -126,7 +127,7 @@ pub(crate) mod mock {
         pub(crate) incoming: VecDeque<io::Result<Vec<u8>>>,
         /// Reads attempted so far, timeouts included.
         pub(crate) reads: usize,
-        /// Fail every write, to exercise the short write paths.
+        /// Fail every write, to exercise the write error paths.
         pub(crate) fail_writes: bool,
     }
 
@@ -169,10 +170,7 @@ pub(crate) mod mock {
     impl HciIo for MockHci {
         fn write_packet(&mut self, pkt: &[u8]) -> io::Result<()> {
             if self.fail_writes {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "mock write failure",
-                ));
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
             }
             self.written.push(pkt.to_vec());
             Ok(())
@@ -266,13 +264,13 @@ mod tests {
     }
 
     #[test]
-    fn send_command_maps_any_write_failure_to_short_write() {
+    fn send_command_keeps_the_write_error() {
         let mut io = MockHci::replaying(Vec::new());
         io.fail_writes = true;
-        assert!(matches!(
-            command(&mut io, OPCODE, &[]),
-            Err(CommandError::ShortWrite)
-        ));
+        match command(&mut io, OPCODE, &[]) {
+            Err(CommandError::Write(e)) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            other => panic!("expected Write, got {other:?}"),
+        }
         // Nothing was read: a failed write never waits for an answer.
         assert_eq!(io.reads, 0);
     }

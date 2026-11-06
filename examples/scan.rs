@@ -26,6 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{iface}: passive scan with the {:?} commands for {seconds} s",
         start.mode
     );
+    // On a fallback, say why the extended commands were not used.
+    if let Some(reason) = &start.fallback {
+        println!("{iface}: extended scan unavailable: {reason}");
+    }
 
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut buf = [0u8; 512];

@@ -177,9 +177,11 @@ pub(crate) fn read_rssi_on<T: HciIo>(io: &mut T, handle: u16) -> Result<Option<i
 pub enum RssiError {
     /// The peer MAC string could not be parsed.
     BadPeer(String),
-    /// `socket()` failed, usually missing `CAP_NET_RAW` / not root.
+    /// `socket()` failed, typically because the kernel has no Bluetooth
+    /// support. The raw HCI socket opens without `CAP_NET_RAW`.
     Socket(io::Error),
-    /// `bind()` to the controller index failed; the adapter is absent or down.
+    /// `bind()` to the controller index failed: there is no controller at that
+    /// index. Binding succeeds for a controller that is down.
     Bind(io::Error),
     /// Setting the HCI event filter failed; without it no events arrive.
     Filter(io::Error),
@@ -187,8 +189,9 @@ pub enum RssiError {
     RecvTimeout(io::Error),
     /// `HCIGETCONNINFO` found no LE connection to the peer on this adapter.
     NoConnection(io::Error),
-    /// The Read RSSI command could not be written in full.
-    ShortWrite,
+    /// The Read RSSI command could not be written. The [`io::Error`] carries
+    /// the kernel's reason; a partial write is [`io::ErrorKind::WriteZero`].
+    Write(io::Error),
     /// The controller answered Read RSSI with a non-zero status.
     Rejected { status: u8 },
     /// A read error while waiting for the command's completion event.
@@ -208,7 +211,7 @@ impl fmt::Display for RssiError {
             RssiError::Filter(e) => write!(f, "cannot set HCI event filter ({e})"),
             RssiError::RecvTimeout(e) => write!(f, "cannot set receive timeout ({e})"),
             RssiError::NoConnection(e) => write!(f, "no LE connection to the peer ({e})"),
-            RssiError::ShortWrite => write!(f, "short write to HCI socket"),
+            RssiError::Write(e) => write!(f, "cannot write Read RSSI command ({e})"),
             RssiError::Rejected { status } => {
                 write!(f, "controller rejected Read RSSI (status 0x{status:02x})")
             }
@@ -229,6 +232,7 @@ impl std::error::Error for RssiError {
             | RssiError::Filter(e)
             | RssiError::RecvTimeout(e)
             | RssiError::NoConnection(e)
+            | RssiError::Write(e)
             | RssiError::Io(e) => Some(e),
             _ => None,
         }
@@ -238,7 +242,7 @@ impl std::error::Error for RssiError {
 impl From<CommandError> for RssiError {
     fn from(err: CommandError) -> Self {
         match err {
-            CommandError::ShortWrite => RssiError::ShortWrite,
+            CommandError::Write(e) => RssiError::Write(e),
             CommandError::Rejected(status) => RssiError::Rejected { status },
             CommandError::Io(e) => RssiError::Io(e),
             CommandError::NoResponse => RssiError::NoResponse,
@@ -316,7 +320,7 @@ mod linux_impl {
         let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
         if fd < 0 {
             return Err(format!(
-                "cannot open HCI control socket (errno {}); need CAP_NET_RAW / root",
+                "cannot open HCI control socket (errno {}); is Bluetooth in the kernel?",
                 unsafe { errno() }
             ));
         }
@@ -634,7 +638,7 @@ mod tests {
         io.fail_writes = true;
         assert!(matches!(
             read_rssi_on(&mut io, 0x0040),
-            Err(RssiError::ShortWrite)
+            Err(RssiError::Write(e)) if e.kind() == io::ErrorKind::PermissionDenied
         ));
         let mut io = MockHci::new(vec![Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -657,6 +661,18 @@ mod tests {
         let e = RssiError::Rejected { status: 0x02 };
         assert_eq!(e.to_string(), "controller rejected Read RSSI (status 0x02)");
         assert!(RssiError::Unsupported.to_string().contains("Linux"));
+    }
+
+    #[test]
+    fn write_error_keeps_the_kernel_error() {
+        use std::error::Error as _;
+        let e = RssiError::Write(io::Error::from(io::ErrorKind::NetworkDown));
+        assert!(e.to_string().starts_with("cannot write Read RSSI command"));
+        let source = e.source().and_then(|s| s.downcast_ref::<io::Error>());
+        assert_eq!(
+            source.map(io::Error::kind),
+            Some(io::ErrorKind::NetworkDown)
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

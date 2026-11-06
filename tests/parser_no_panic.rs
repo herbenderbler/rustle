@@ -1,8 +1,8 @@
 //! Adversarial-input no-panic harness for the BLE byte parsers.
 //!
 //! The whole point of the in-house stack is that attacker-controlled
-//! advertisement / ATT bytes are decoded in **safe Rust** rather than the C
-//! (`libdbus` → `dbus`) that btleplug pulled in. "Safe" still requires that a
+//! advertisement / ATT bytes are decoded in **safe Rust** rather than in a C
+//! library behind a D-Bus binding. "Safe" still requires that a
 //! malformed frame can't *panic* — an unhandled slice index or arithmetic
 //! overflow on a hostile advertisement would be a remote DoS of the scanner. So
 //! this feeds a large, deterministic mix of random and seed-mutated byte strings
@@ -12,7 +12,7 @@
 //! `cargo fuzz` targets under `fuzz/` (which need nightly): those
 //! explore deeper, this one gates every PR. See `fuzz/README.md`.
 
-use rustle::{att, conn, hci};
+use rustle::{att, conn, hci, mgmt};
 
 /// Tiny deterministic PRNG (xorshift64*), so any failure reproduces from the
 /// fixed seed rather than being a heisenbug.
@@ -41,6 +41,7 @@ impl Rng {
 fn feed_all(buf: &[u8]) {
     let _ = hci::parse_hci_packet(buf);
     let _ = hci::parse_ad_structures(buf);
+    let _ = hci::ad_structures(buf).count();
     let _ = hci::parse_le_advertising_report(buf);
     let _ = hci::parse_le_extended_advertising_report(buf);
     let _ = hci::is_adv_report_packet(buf);
@@ -52,6 +53,7 @@ fn feed_all(buf: &[u8]) {
     let _ = conn::read_rssi_outcome(0x0040, buf);
     let _ = conn::parse_conn_info_handle(buf);
     let _ = conn::parse_conn_list(buf);
+    let _ = mgmt::parse_command_reply(buf);
 }
 
 /// Valid-ish frames worth mutating around, so the fuzzer spends time near the

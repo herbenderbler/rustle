@@ -1,10 +1,11 @@
 //! Find a device by name, connect to it and read its battery level.
 //!
 //! Usage: `battery <name prefix> [hciN] [seconds]`. The scan runs on `hci0`
-//! for up to ten seconds by default. Both sockets need `CAP_NET_RAW`; see
-//! INSTALL.md. USAGE.md explains each step.
+//! for up to ten seconds by default, and the connection goes through the same
+//! adapter. Both sockets need `CAP_NET_RAW`, and the active scan also needs
+//! `CAP_NET_ADMIN`; see INSTALL.md. USAGE.md explains each step.
 
-use rustle::adapter::index_from_name;
+use rustle::adapter::{self, index_from_name};
 use rustle::client::GattClient;
 use rustle::hci::{parse_hci_packet, AddrType};
 use rustle::l2cap::{L2capAtt, SecurityLevel};
@@ -34,10 +35,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| format!("no device named {prefix}* heard in {seconds} s"))?;
     println!("found {address} (random address: {random})");
 
-    // Step 2: connect. The scanner was dropped inside find_device, so the
-    // controller is no longer scanning while the kernel connects.
+    // Step 2: connect through the adapter that heard the device. With None
+    // the kernel would pick its default adapter, which may be another one.
+    // The scanner was dropped inside find_device, so the controller is no
+    // longer scanning while the kernel connects.
+    let local = adapter::info(dev)?.address;
     let link = L2capAtt::connect_timeout(
-        None,
+        Some(&local),
         false,
         &address,
         random,
@@ -75,11 +79,13 @@ fn find_device(
     timeout: Duration,
 ) -> Result<Option<(String, bool)>, Box<dyn Error>> {
     let mut scanner = HciScanner::open(dev, Duration::from_millis(500))?;
+    // An active scan also needs CAP_NET_ADMIN; see INSTALL.md.
     scanner.start(ScanParams::new(ScanType::Active, OwnAddrType::Public))?;
 
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 512];
-    while Instant::now() < deadline {
+    let mut found = None;
+    while found.is_none() && Instant::now() < deadline {
         let n = match scanner.read(&mut buf) {
             Ok(n) => n,
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
@@ -87,13 +93,16 @@ fn find_device(
             }
             Err(e) => return Err(e.into()),
         };
-        for report in parse_hci_packet(&buf[..n]) {
+        found = parse_hci_packet(&buf[..n]).into_iter().find_map(|report| {
             let name = report.ad.local_name.as_deref().unwrap_or("");
-            if name.starts_with(prefix) {
-                let random = report.addr_type == AddrType::Random;
-                return Ok(Some((report.address, random)));
-            }
-        }
+            name.starts_with(prefix)
+                .then(|| (report.address, report.addr_type == AddrType::Random))
+        });
     }
-    Ok(None)
+
+    // Stop explicitly rather than on drop, so a failure is reported. After an
+    // active scan, stop() also ends the discovery the kernel believes the scan
+    // started; until it ends, the kernel would never make the connection.
+    scanner.stop()?;
+    Ok(found)
 }
