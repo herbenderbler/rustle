@@ -131,21 +131,22 @@ pub struct CommandReply {
 /// every other event, and for a buffer too short for its own header or for
 /// the length that header declares.
 pub fn parse_command_reply(buf: &[u8]) -> Option<CommandReply> {
-    let header = buf.get(..6)?;
-    let event = u16::from_le_bytes([header[0], header[1]]);
-    let index = u16::from_le_bytes([header[2], header[3]]);
-    let len = u16::from_le_bytes([header[4], header[5]]) as usize;
-    let params = buf.get(6..6 + len)?;
-    if event != EV_COMMAND_COMPLETE && event != EV_COMMAND_STATUS {
+    // event(2) index(2) param_len(2), then the parameters.
+    let (&[e0, e1, i0, i1, l0, l1], rest) = buf.split_first_chunk::<6>()?;
+    let params = rest.get(..u16::from_le_bytes([l0, l1]).into())?;
+    if !matches!(
+        u16::from_le_bytes([e0, e1]),
+        EV_COMMAND_COMPLETE | EV_COMMAND_STATUS
+    ) {
         return None;
     }
-    let (opcode, status) = match params {
-        [lo, hi, status, ..] => (u16::from_le_bytes([*lo, *hi]), *status),
-        _ => return None,
+    // opcode(2) status(1), then any return parameters.
+    let &[lo, hi, status, ..] = params else {
+        return None;
     };
     Some(CommandReply {
-        index,
-        opcode,
+        index: u16::from_le_bytes([i0, i1]),
+        opcode: u16::from_le_bytes([lo, hi]),
         status,
     })
 }

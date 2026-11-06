@@ -179,24 +179,28 @@ mod linux_impl {
             unsafe { close(fd) };
             return Err(format!("HCIGETDEVLIST failed (errno {e})"));
         }
-        let count = (u16::from_le_bytes([list[0], list[1]]) as usize).min(HCI_MAX_DEV);
+        let count = u16::from_le_bytes([list[0], list[1]]).into();
 
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            let off = DEV_LIST_HDR + i * DEV_REQ_SIZE;
-            let dev_id = u16::from_le_bytes([list[off], list[off + 1]]);
-
-            // hci_dev_info: set dev_id, then the ioctl fills the rest.
-            let mut info = vec![0u8; DEV_INFO_BUF];
-            info[0..2].copy_from_slice(&dev_id.to_le_bytes());
-            let rc = unsafe { ioctl(fd, HCIGETDEVINFO, info.as_mut_ptr() as *mut c_void) };
-            if rc < 0 {
-                continue; // adapter vanished between list and info — skip it
-            }
-            if let Some(ai) = parse_dev_info(&info) {
-                out.push(ai);
-            }
-        }
+        // The buffer holds HCI_MAX_DEV `hci_dev_req` slots, so a count past
+        // that reads no further.
+        let out = list[DEV_LIST_HDR..]
+            .as_chunks::<DEV_REQ_SIZE>()
+            .0
+            .iter()
+            .take(count)
+            .filter_map(|&[id0, id1, ..]| {
+                // hci_dev_info: set dev_id, then the ioctl fills the rest.
+                let mut info = vec![0u8; DEV_INFO_BUF];
+                info[0..2].copy_from_slice(&[id0, id1]);
+                let rc = unsafe { ioctl(fd, HCIGETDEVINFO, info.as_mut_ptr() as *mut c_void) };
+                // An adapter that vanished between list and info is skipped.
+                if rc < 0 {
+                    None
+                } else {
+                    parse_dev_info(&info)
+                }
+            })
+            .collect();
 
         unsafe { close(fd) };
         Ok(out)

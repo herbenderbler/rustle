@@ -219,11 +219,7 @@ pub struct AdvReport {
 
 /// Decode an HCI RSSI byte: `0x7F` is the spec sentinel for "not available".
 fn rssi_from_byte(b: u8) -> Option<i32> {
-    if b == 0x7f {
-        None
-    } else {
-        Some(b as i8 as i32)
-    }
+    (b != 0x7f).then_some(b as i8 as i32)
 }
 
 /// Format a 6-byte HCI address (little-endian on the wire) as an uppercase,
@@ -257,12 +253,14 @@ pub fn format_uuid32(v: u32) -> String {
 
 /// Format 16 little-endian UUID bytes as a canonical lowercase UUID string.
 pub fn format_uuid128(le: &[u8; 16]) -> String {
-    let mut b = *le;
-    b.reverse();
+    let v = u128::from_le_bytes(*le);
     format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14],
-        b[15],
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        v >> 96,
+        (v >> 80) & 0xffff,
+        (v >> 64) & 0xffff,
+        (v >> 48) & 0xffff,
+        v & 0xffff_ffff_ffff,
     )
 }
 
@@ -309,52 +307,48 @@ impl ParsedAd {
                 self.local_name = Some(String::from_utf8_lossy(value).to_string());
             }
             AD_INCOMPLETE_16BIT_UUIDS | AD_COMPLETE_16BIT_UUIDS => {
-                for chunk in value.as_chunks::<2>().0 {
-                    let v = u16::from_le_bytes(*chunk);
-                    self.service_uuids.push(format_uuid16(v));
-                }
+                let uuids = value.as_chunks::<2>().0.iter();
+                self.service_uuids
+                    .extend(uuids.map(|&u| format_uuid16(u16::from_le_bytes(u))));
             }
             AD_INCOMPLETE_32BIT_UUIDS | AD_COMPLETE_32BIT_UUIDS => {
-                for chunk in value.as_chunks::<4>().0 {
-                    let v = u32::from_le_bytes(*chunk);
-                    self.service_uuids.push(format_uuid32(v));
-                }
+                let uuids = value.as_chunks::<4>().0.iter();
+                self.service_uuids
+                    .extend(uuids.map(|&u| format_uuid32(u32::from_le_bytes(u))));
             }
             AD_INCOMPLETE_128BIT_UUIDS | AD_COMPLETE_128BIT_UUIDS => {
-                for chunk in value.as_chunks::<16>().0 {
-                    self.service_uuids.push(format_uuid128(chunk));
-                }
+                let uuids = value.as_chunks::<16>().0.iter();
+                self.service_uuids.extend(uuids.map(format_uuid128));
             }
+            // Each keyed payload leads with its key; a value too short to hold
+            // the key is dropped.
             AD_MANUFACTURER_DATA => {
-                if value.len() >= 2 {
-                    let company = u16::from_le_bytes([value[0], value[1]]);
-                    self.manufacturer_data.insert(company, value[2..].to_vec());
+                if let Some((&company, data)) = value.split_first_chunk::<2>() {
+                    self.manufacturer_data
+                        .insert(u16::from_le_bytes(company), data.to_vec());
                 }
             }
             AD_SERVICE_DATA_16BIT => {
-                if value.len() >= 2 {
-                    let uuid = format_uuid16(u16::from_le_bytes([value[0], value[1]]));
-                    self.service_data.insert(uuid, value[2..].to_vec());
+                if let Some((&uuid, data)) = value.split_first_chunk::<2>() {
+                    self.service_data
+                        .insert(format_uuid16(u16::from_le_bytes(uuid)), data.to_vec());
                 }
             }
             AD_SERVICE_DATA_32BIT => {
-                if value.len() >= 4 {
-                    let v = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                if let Some((&uuid, data)) = value.split_first_chunk::<4>() {
                     self.service_data
-                        .insert(format_uuid32(v), value[4..].to_vec());
+                        .insert(format_uuid32(u32::from_le_bytes(uuid)), data.to_vec());
                 }
             }
             AD_SERVICE_DATA_128BIT => {
-                if value.len() >= 16 {
-                    let mut uuid_le = [0u8; 16];
-                    uuid_le.copy_from_slice(&value[..16]);
+                if let Some((uuid, data)) = value.split_first_chunk::<16>() {
                     self.service_data
-                        .insert(format_uuid128(&uuid_le), value[16..].to_vec());
+                        .insert(format_uuid128(uuid), data.to_vec());
                 }
             }
             AD_APPEARANCE => {
-                if value.len() >= 2 {
-                    self.appearance = Some(u16::from_le_bytes([value[0], value[1]]));
+                if let Some(&appearance) = value.first_chunk::<2>() {
+                    self.appearance = Some(u16::from_le_bytes(appearance));
                 }
             }
             AD_TX_POWER_LEVEL => {
@@ -368,6 +362,27 @@ impl ParsedAd {
     }
 }
 
+/// The reports of an advertising report sub-event: a `num_reports` byte, then
+/// that many variable-length reports, each split off the front of the
+/// remaining bytes by `report`. Decoding stops after `num_reports` reports or
+/// at the first one `report` cannot split, so truncated input yields the
+/// reports decoded before it.
+fn reports<'a>(
+    params: &'a [u8],
+    mut report: impl FnMut(&'a [u8]) -> Option<(AdvReport, &'a [u8])>,
+) -> Vec<AdvReport> {
+    let Some((&num_reports, mut rest)) = params.split_first() else {
+        return Vec::new();
+    };
+    std::iter::from_fn(|| {
+        let (decoded, tail) = report(rest)?;
+        rest = tail;
+        Some(decoded)
+    })
+    .take(num_reports.into())
+    .collect()
+}
+
 /// Parse the parameters of an `LE Advertising Report` sub-event (everything
 /// after the sub-event code byte) into zero or more [`AdvReport`]s.
 ///
@@ -377,43 +392,21 @@ impl ParsedAd {
 /// report per event; multiple reports are parsed sequentially.  Truncated
 /// input stops parsing and returns the reports decoded so far.
 pub fn parse_le_advertising_report(params: &[u8]) -> Vec<AdvReport> {
-    let mut reports = Vec::new();
-    if params.is_empty() {
-        return reports;
-    }
-    let num_reports = params[0] as usize;
-    let mut cur = 1usize;
-
-    for _ in 0..num_reports {
-        // event_type(1) + addr_type(1) + addr(6) + data_len(1) = 9 bytes minimum
-        if cur + 9 > params.len() {
-            break;
-        }
-        let pdu = AdvPdu::from_legacy_event_type(params[cur]);
-        let addr_type = AddrType::from_hci(params[cur + 1]);
-        let addr = &params[cur + 2..cur + 8];
-        let data_len = params[cur + 8] as usize;
-        let data_start = cur + 9;
-        let data_end = data_start + data_len;
-        // need data_len bytes of AD plus one trailing RSSI byte
-        if data_end + 1 > params.len() {
-            break;
-        }
-        let ad_bytes = &params[data_start..data_end];
-        let rssi = rssi_from_byte(params[data_end]);
-
-        reports.push(AdvReport {
+    reports(params, |rest| {
+        let (&[event_type, addr_type], rest) = rest.split_first_chunk::<2>()?;
+        let (addr, rest) = rest.split_first_chunk::<6>()?;
+        let (&data_len, rest) = rest.split_first()?;
+        let (ad, rest) = rest.split_at_checked(data_len.into())?;
+        let (&rssi, rest) = rest.split_first()?;
+        let report = AdvReport {
             address: format_addr_le(addr),
-            addr_type,
-            rssi,
-            pdu,
-            ad: parse_ad_structures(ad_bytes),
-        });
-
-        cur = data_end + 1;
-    }
-
-    reports
+            addr_type: AddrType::from_hci(addr_type),
+            rssi: rssi_from_byte(rssi),
+            pdu: AdvPdu::from_legacy_event_type(event_type),
+            ad: parse_ad_structures(ad),
+        };
+        Some((report, rest))
+    })
 }
 
 /// Parse the parameters of an `LE Extended Advertising Report` sub-event
@@ -430,50 +423,31 @@ pub fn parse_le_advertising_report(params: &[u8]) -> Vec<AdvReport> {
 /// once an extended scan is enabled — so decoding it is required to see those
 /// devices at all.  Truncated input stops parsing and returns what was decoded.
 pub fn parse_le_extended_advertising_report(params: &[u8]) -> Vec<AdvReport> {
-    let mut reports = Vec::new();
-    if params.is_empty() {
-        return reports;
-    }
-    let num_reports = params[0] as usize;
-    let mut cur = 1usize;
-    // Fixed per-report fields preceding the variable-length AD data.
-    const REPORT_HDR: usize = 24;
-
-    for _ in 0..num_reports {
-        if cur + REPORT_HDR > params.len() {
-            break;
-        }
-        let pdu = AdvPdu::from_ext_event_type(u16::from_le_bytes([params[cur], params[cur + 1]]));
-        let addr_type = AddrType::from_hci(params[cur + 2]);
-        let addr = &params[cur + 3..cur + 9];
-        let tx_power = params[cur + 12] as i8; // 0x7F = not available
-        let rssi = rssi_from_byte(params[cur + 13]);
-        let data_len = params[cur + 23] as usize;
-        let data_start = cur + REPORT_HDR;
-        let data_end = data_start + data_len;
-        if data_end > params.len() {
-            break;
-        }
-        let ad_bytes = &params[data_start..data_end];
-        let mut ad = parse_ad_structures(ad_bytes);
+    reports(params, |rest| {
+        let (&event_type, rest) = rest.split_first_chunk::<2>()?;
+        let (&addr_type, rest) = rest.split_first()?;
+        let (addr, rest) = rest.split_first_chunk::<6>()?;
+        let (&[_primary_phy, _secondary_phy, _adv_sid, tx_power, rssi], rest) =
+            rest.split_first_chunk::<5>()?;
+        // periodic_interval(2) direct_addr_type(1) direct_addr(6)
+        let (_, rest) = rest.split_first_chunk::<9>()?;
+        let (&data_len, rest) = rest.split_first()?;
+        let (ad, rest) = rest.split_at_checked(data_len.into())?;
+        let mut ad = parse_ad_structures(ad);
         // Prefer the header TX-power field when the AD carried no TX-power
         // structure of its own (0x7F means the controller had no value).
         if ad.tx_power.is_none() && tx_power != 0x7f {
-            ad.tx_power = Some(tx_power);
+            ad.tx_power = Some(tx_power as i8);
         }
-
-        reports.push(AdvReport {
+        let report = AdvReport {
             address: format_addr_le(addr),
-            addr_type,
-            rssi,
-            pdu,
+            addr_type: AddrType::from_hci(addr_type),
+            rssi: rssi_from_byte(rssi),
+            pdu: AdvPdu::from_ext_event_type(u16::from_le_bytes(event_type)),
             ad,
-        });
-
-        cur = data_end;
-    }
-
-    reports
+        };
+        Some((report, rest))
+    })
 }
 
 /// HCI packet indicator for events (first byte of a raw-socket datagram).
@@ -496,24 +470,14 @@ pub(crate) const HCI_EV_CMD_STATUS: u8 = 0x0F;
 /// vector for non-event packets, non-LE-meta events, and non-advertising-report
 /// sub-events, as well as for any truncated input.
 pub fn parse_hci_packet(buf: &[u8]) -> Vec<AdvReport> {
-    // [type=0x04][event_code][param_len][params…]
-    if buf.len() < 3 || buf[0] != HCI_EVENT_PKT {
-        return Vec::new();
-    }
-    let event_code = buf[1];
-    let param_len = buf[2] as usize;
-    let params_end = 3 + param_len;
-    if params_end > buf.len() {
-        return Vec::new();
-    }
-    let params = &buf[3..params_end];
-
-    if event_code != HCI_EV_LE_META || params.is_empty() {
-        return Vec::new();
-    }
-    match params[0] {
-        HCI_SUBEV_LE_ADVERTISING_REPORT => parse_le_advertising_report(&params[1..]),
-        HCI_SUBEV_LE_EXT_ADVERTISING_REPORT => parse_le_extended_advertising_report(&params[1..]),
+    // LE Meta parameters: [sub-event code][sub-event parameters…]
+    match event_params(buf) {
+        Some((HCI_EV_LE_META, [HCI_SUBEV_LE_ADVERTISING_REPORT, report @ ..])) => {
+            parse_le_advertising_report(report)
+        }
+        Some((HCI_EV_LE_META, [HCI_SUBEV_LE_EXT_ADVERTISING_REPORT, report @ ..])) => {
+            parse_le_extended_advertising_report(report)
+        }
         _ => Vec::new(),
     }
 }
@@ -526,13 +490,18 @@ pub fn parse_hci_packet(buf: &[u8]) -> Vec<AdvReport> {
 /// (Command Complete, connection events, …) are *not* adv-report packets, so a
 /// legitimately empty decode of those is never miscounted.
 pub fn is_adv_report_packet(buf: &[u8]) -> bool {
-    buf.len() >= 4
-        && buf[0] == HCI_EVENT_PKT
-        && buf[1] == HCI_EV_LE_META
-        && matches!(
-            buf[3],
-            HCI_SUBEV_LE_ADVERTISING_REPORT | HCI_SUBEV_LE_EXT_ADVERTISING_REPORT
-        )
+    // [type=0x04][event_code=0x3E][param_len][sub-event code]…, whatever
+    // param_len claims.
+    matches!(
+        buf,
+        [
+            HCI_EVENT_PKT,
+            HCI_EV_LE_META,
+            _,
+            HCI_SUBEV_LE_ADVERTISING_REPORT | HCI_SUBEV_LE_EXT_ADVERTISING_REPORT,
+            ..
+        ]
+    )
 }
 
 /// Split an HCI event packet into its event code and parameters. `None` for a
