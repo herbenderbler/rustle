@@ -179,6 +179,9 @@ impl<T: AttIo> GattClient<T> {
             .first()
             .ok_or_else(|| GattError::Protocol("empty request".into()))?;
         self.io.send(req)?;
+        // Values queued by this request alone; earlier ones the caller has
+        // not drained yet do not count against it.
+        let mut queued = 0;
         loop {
             let raw = self.io.recv()?;
             let opcode = *raw
@@ -188,31 +191,26 @@ impl<T: AttIo> GattClient<T> {
                 .ok_or_else(|| GattError::Protocol(format!("undecodable PDU 0x{opcode:02x}")))?;
             match as_event(pdu) {
                 Ok((handle, value, needs_confirmation)) => {
-                    self.queue_event(handle, value)?;
+                    // Confirm first: the peer can send no further indication
+                    // until it has the confirmation, even if this request then
+                    // fails.
                     if needs_confirmation {
                         self.confirm()?;
                     }
+                    // A hostile peripheral could stream values forever instead
+                    // of answering, pinning this loop and growing `pending`
+                    // without bound, so the request fails closed at the cap.
+                    if queued == MAX_PENDING_VALUES {
+                        return Err(GattError::Protocol(
+                            "too many queued values while awaiting response".into(),
+                        ));
+                    }
+                    self.pending.push_back((handle, value));
+                    queued += 1;
                 }
                 Err(pdu) => return settle(pdu, opcode, req_opcode, want_opcode),
             }
         }
-    }
-
-    /// Queue a notification/indication that arrived while a request was
-    /// outstanding, for [`take_notifications`](Self::take_notifications) or
-    /// [`next_event`](Self::next_event) to hand out later.
-    fn queue_event(&mut self, handle: u16, value: Vec<u8>) -> Result<(), GattError> {
-        // A hostile peripheral could stream notifications/indications forever
-        // instead of answering, pinning `request` and growing `pending` without
-        // bound. Cap the queue so such a peer errors the request out rather
-        // than exhausting memory / never returning.
-        if self.pending.len() >= MAX_PENDING_VALUES {
-            return Err(GattError::Protocol(
-                "too many queued values while awaiting response".into(),
-            ));
-        }
-        self.pending.push_back((handle, value));
-        Ok(())
     }
 
     /// Send the Handle Value Confirmation that every indication requires.
@@ -1065,5 +1063,34 @@ mod tests {
         assert!(matches!(err, GattError::Protocol(_)));
         assert_eq!(client.io.sent, vec![vec![0x0A, 0x05, 0x00]]);
         assert_eq!(client.take_notifications().len(), MAX_PENDING_VALUES);
+    }
+
+    #[test]
+    fn the_queue_cap_counts_one_request_at_a_time() {
+        // Two reads, each preceded by most of a cap's worth of notifications
+        // the caller never drains. Each read stays under the cap on its own,
+        // so both succeed, and every value is kept.
+        let ntf = vec![0x1B, 0x03, 0x00, 0xAA];
+        let burst = MAX_PENDING_VALUES - 1;
+        let mut responses = vec![ntf.clone(); burst];
+        responses.push(vec![0x0B, 0x01]);
+        responses.extend(vec![ntf; burst]);
+        responses.push(vec![0x0B, 0x02]);
+        let mut client = GattClient::new(MockIo::new(responses));
+        assert_eq!(client.read(0x0005).unwrap(), vec![0x01]);
+        assert_eq!(client.read(0x0005).unwrap(), vec![0x02]);
+        assert_eq!(client.take_notifications().len(), 2 * burst);
+    }
+
+    #[test]
+    fn an_indication_past_the_cap_is_still_confirmed() {
+        // The value that trips the cap is an indication. The read fails, but
+        // the peer still gets its confirmation, so it is free to send again.
+        let ntf = vec![0x1B, 0x03, 0x00, 0xAA];
+        let mut responses = vec![ntf; MAX_PENDING_VALUES];
+        responses.push(vec![0x1D, 0x03, 0x00, 0xCC]);
+        let mut client = GattClient::new(MockIo::new(responses));
+        assert!(matches!(client.read(0x0005), Err(GattError::Protocol(_))));
+        assert_eq!(client.io.sent.last(), Some(&vec![att::OP_HANDLE_VALUE_CFM]));
     }
 }

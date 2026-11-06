@@ -420,17 +420,22 @@ mod driver {
                     mode: ScanMode::Extended,
                     fallback: None,
                 }),
-                // A Coded-only request has no legacy equivalent: a 1M legacy
-                // scan would listen on the wrong PHY, so the rejection is
-                // surfaced instead of narrowing the request.
-                Err(ext_err) if !params.phys.legacy_fallback_covers() => Err(ext_err),
-                Err(ext_err) => {
+                // Only a controller that rejects the extended set gets the
+                // legacy one. A write or read failure, or a missing answer,
+                // would fail the legacy set the same way, so it is returned
+                // as is. A Coded-only request has no legacy equivalent: a 1M
+                // legacy scan would listen on the wrong PHY, so its rejection
+                // is surfaced instead of narrowing the request.
+                Err(ext_err @ ScanError::Rejected { .. })
+                    if params.phys.legacy_fallback_covers() =>
+                {
                     self.program(&legacy_commands(&params))?;
                     Ok(ScanStart {
                         mode: ScanMode::Legacy,
                         fallback: Some(ext_err),
                     })
                 }
+                Err(ext_err) => Err(ext_err),
             }
         }
 
@@ -992,16 +997,15 @@ mod tests {
             Err(ScanError::NoResponse)
         ));
         drop(driver);
-        // The pre-clear, the extended parameters that got no answer, the
-        // legacy parameters tried next that got none either, then the disables
-        // on drop.
+        // The pre-clear, the extended parameters that got no answer, then the
+        // disables on drop. A missing answer is not a rejection, so the legacy
+        // set is not tried.
         assert_eq!(
             io.written_opcodes(),
             vec![
                 OPCODE_LE_SET_SCAN_ENABLE,
                 OPCODE_LE_SET_EXT_SCAN_ENABLE,
                 OPCODE_LE_SET_EXT_SCAN_PARAMS,
-                OPCODE_LE_SET_SCAN_PARAMS,
                 OPCODE_LE_SET_SCAN_ENABLE,
                 OPCODE_LE_SET_EXT_SCAN_ENABLE,
             ]
