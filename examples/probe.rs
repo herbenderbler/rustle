@@ -16,7 +16,9 @@
 //!
 //! The steps, each reported as it runs:
 //!
-//! 1. Connect through the named adapter at the requested security level.
+//! 1. Connect through the named adapter, wait for the link to reach the
+//!    requested security level and print the level it reached. Above `low`
+//!    the kernel pairs, and a pairing agent must approve it; see USAGE.md.
 //! 2. Exchange the MTU and print the whole attribute table.
 //! 3. Read the connection's RSSI while the link is open.
 //! 4. Read every readable characteristic. ATT error `0x05` or `0x0F` means
@@ -114,8 +116,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
     let local = adapter::info(args.dev)?.address;
 
-    // Step 1. Pairing for Medium or High happens during the connect, and the
-    // kernel gives up on it after 30 s, so allow longer than that.
+    // Step 1. At Medium or High the connect also waits for pairing, which the
+    // kernel gives up on after 30 s, so allow longer than that.
     let timeout = match args.security {
         SecurityLevel::Low => Duration::from_secs(10),
         _ => Duration::from_secs(40),
@@ -137,12 +139,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             started.elapsed().as_millis()
         )
     })?;
+    let elapsed = started.elapsed().as_millis();
     println!(
-        "connected to {} through hci{} at {:?} in {} ms",
+        "connected to {} through hci{} in {elapsed} ms, link security {:?}",
         args.address,
         args.dev,
-        args.security,
-        started.elapsed().as_millis()
+        link.security()?
     );
 
     // Step 2.
