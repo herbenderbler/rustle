@@ -71,10 +71,9 @@ mod linux_impl {
     use super::{mac_str_to_le, SecurityLevel};
     use crate::client::AttIo;
     use crate::sys::{
-        bind, close, connect, errno, fcntl, getsockopt, poll, read, set_recv_timeout, setsockopt,
-        socket, write, FdGuard, PollFd, Timeval, AF_BLUETOOTH, BTPROTO_L2CAP, EAGAIN, EINPROGRESS,
-        EINTR, F_GETFL, F_SETFL, O_NONBLOCK, POLLERR, POLLHUP, POLLOUT, SOCK_SEQPACKET, SOL_SOCKET,
-        SO_ERROR,
+        bind, connect, fcntl, getsockopt, poll, setsockopt, PollFd, Socket, AF_BLUETOOTH,
+        BTPROTO_L2CAP, EINPROGRESS, F_GETFL, F_SETFL, O_NONBLOCK, POLLERR, POLLHUP, POLLOUT,
+        SOCK_SEQPACKET, SOL_SOCKET, SO_ERROR,
     };
     use std::io;
     use std::os::raw::{c_int, c_void};
@@ -160,11 +159,11 @@ mod linux_impl {
         };
         let rc = unsafe { poll(&mut pfd, 1, ms) };
         if rc < 0 {
-            let e = unsafe { errno() };
-            return if e == EINTR {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::Interrupted {
                 Ok(())
             } else {
-                Err(io::Error::from_raw_os_error(e))
+                Err(e)
             };
         }
         if pfd.revents & (POLLHUP | POLLERR) == 0 {
@@ -246,19 +245,12 @@ mod linux_impl {
     /// A connected L2CAP ATT channel. Implements [`AttIo`]; closes the socket on
     /// drop.
     pub struct L2capAtt {
-        fd: c_int,
-    }
-
-    impl Drop for L2capAtt {
-        fn drop(&mut self) {
-            unsafe { close(self.fd) };
-        }
+        sock: Socket,
     }
 
     impl L2capAtt {
         /// Create, bind and configure the ATT socket, stopping just short of
-        /// the connect. Returns the guarded fd (closed on early return until
-        /// ownership moves) and the peer sockaddr to connect to.
+        /// the connect. Returns the socket and the peer sockaddr to connect to.
         fn prepare(
             local: Option<&str>,
             local_random: bool,
@@ -266,7 +258,7 @@ mod linux_impl {
             peer_random: bool,
             security: SecurityLevel,
             recv_timeout_secs: i64,
-        ) -> io::Result<(FdGuard, SockaddrL2)> {
+        ) -> io::Result<(Socket, SockaddrL2)> {
             let peer_addr = mac_str_to_le(peer).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -280,11 +272,17 @@ mod linux_impl {
                 None => [0u8; 6], // BDADDR_ANY
             };
 
-            let fd = unsafe { socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP) };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let guard = FdGuard(fd);
+            let recv_timeout = u64::try_from(recv_timeout_secs)
+                .map(Duration::from_secs)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("negative receive timeout {recv_timeout_secs} s"),
+                    )
+                })?;
+
+            let sock = Socket::open(SOCK_SEQPACKET, BTPROTO_L2CAP)?;
+            let fd = sock.fd();
 
             // Bind the local side (adapter + own address type) on the ATT CID.
             let la = sockaddr(local_addr, local_random);
@@ -299,29 +297,31 @@ mod linux_impl {
                 return Err(io::Error::last_os_error());
             }
 
-            // Requested security level. Low is the kernel's default, so only a
-            // failure to ask for more matters.
-            let sec = BtSecurity {
-                level: security as u8,
-                key_size: 0,
-            };
-            let rc = unsafe {
-                setsockopt(
-                    fd,
-                    SOL_BLUETOOTH,
-                    BT_SECURITY,
-                    &sec as *const BtSecurity as *const c_void,
-                    std::mem::size_of::<BtSecurity>() as u32,
-                )
-            };
-            if rc < 0 && security > SecurityLevel::Low {
-                return Err(io::Error::last_os_error());
+            // Requested security level. Low is the kernel's default for a new
+            // socket, so there is nothing to ask for.
+            if security > SecurityLevel::Low {
+                let sec = BtSecurity {
+                    level: security as u8,
+                    key_size: 0,
+                };
+                let rc = unsafe {
+                    setsockopt(
+                        fd,
+                        SOL_BLUETOOTH,
+                        BT_SECURITY,
+                        &sec as *const BtSecurity as *const c_void,
+                        std::mem::size_of::<BtSecurity>() as u32,
+                    )
+                };
+                if rc < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
 
             // Receive timeout so a notify read loop stays responsive to shutdown.
-            set_recv_timeout(fd, &Timeval::from_secs(recv_timeout_secs));
+            sock.set_recv_timeout(recv_timeout)?;
 
-            Ok((guard, sockaddr(peer_addr, peer_random)))
+            Ok((sock, sockaddr(peer_addr, peer_random)))
         }
 
         /// Open an ATT channel to `peer` (a display MAC), sourced from adapter
@@ -349,7 +349,7 @@ mod linux_impl {
             security: SecurityLevel,
             recv_timeout_secs: i64,
         ) -> io::Result<Self> {
-            let (guard, pa) = Self::prepare(
+            let (sock, pa) = Self::prepare(
                 local,
                 local_random,
                 peer,
@@ -359,7 +359,7 @@ mod linux_impl {
             )?;
 
             // Connect — the kernel performs the LE connection + L2CAP channel setup.
-            let fd = guard.0;
+            let fd = sock.fd();
             let rc = unsafe {
                 connect(
                     fd,
@@ -371,9 +371,7 @@ mod linux_impl {
                 return Err(io::Error::last_os_error());
             }
             await_security(fd, peer, security, Instant::now() + PAIRING_WAIT)?;
-
-            std::mem::forget(guard); // success — ownership moves to L2capAtt
-            Ok(L2capAtt { fd })
+            Ok(L2capAtt { sock })
         }
 
         /// [`connect`](Self::connect) with a deadline on the connection
@@ -398,7 +396,7 @@ mod linux_impl {
             recv_timeout_secs: i64,
             timeout: Duration,
         ) -> io::Result<Self> {
-            let (guard, pa) = Self::prepare(
+            let (sock, pa) = Self::prepare(
                 local,
                 local_random,
                 peer,
@@ -406,7 +404,7 @@ mod linux_impl {
                 security,
                 recv_timeout_secs,
             )?;
-            let fd = guard.0;
+            let fd = sock.fd();
             let deadline = Instant::now() + timeout;
 
             // Non-blocking, so connect() returns at once with EINPROGRESS.
@@ -426,9 +424,9 @@ mod linux_impl {
                 )
             };
             if rc < 0 {
-                let e = unsafe { errno() };
-                if e != EINPROGRESS {
-                    return Err(io::Error::from_raw_os_error(e));
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(EINPROGRESS) {
+                    return Err(e);
                 }
 
                 // Await writability (the connect's completion) within the
@@ -451,9 +449,9 @@ mod linux_impl {
                             format!("connect to {peer} timed out"),
                         ));
                     }
-                    let e = unsafe { errno() };
-                    if e != EINTR {
-                        return Err(io::Error::from_raw_os_error(e));
+                    let e = io::Error::last_os_error();
+                    if e.kind() != io::ErrorKind::Interrupted {
+                        return Err(e);
                     }
                 }
 
@@ -468,56 +466,41 @@ mod linux_impl {
                 return Err(io::Error::last_os_error());
             }
             await_security(fd, peer, security, deadline)?;
-
-            std::mem::forget(guard); // success — ownership moves to L2capAtt
-            Ok(L2capAtt { fd })
+            Ok(L2capAtt { sock })
         }
 
         /// The link's current security level. After a successful connect it
         /// is at least the level that was requested. Fails once the link is
         /// gone.
         pub fn security(&self) -> io::Result<SecurityLevel> {
-            let raw = bt_security(self.fd)?;
-            link_up(self.fd, 0)?;
+            let raw = bt_security(self.sock.fd())?;
+            link_up(self.sock.fd(), 0)?;
             Ok(SecurityLevel::from_bt_security(raw))
         }
     }
 
     impl AttIo for L2capAtt {
         fn send(&mut self, pdu: &[u8]) -> io::Result<()> {
-            let n = unsafe { write(self.fd, pdu.as_ptr() as *const c_void, pdu.len()) };
-            if n == pdu.len() as isize {
-                Ok(())
-            } else if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Err(io::Error::new(io::ErrorKind::WriteZero, "short ATT write"))
-            }
+            self.sock.write_packet(pdu)
         }
 
         fn recv(&mut self) -> io::Result<Vec<u8>> {
             // One SEQPACKET datagram = one ATT PDU. ATT MTU tops out at 517.
             let mut buf = [0u8; 1024];
-            let n = unsafe { read(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-            if n > 0 {
-                Ok(buf[..n as usize].to_vec())
-            } else if n == 0 {
-                Err(io::Error::new(
+            match self.sock.read(&mut buf) {
+                Ok(0) => Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "peer closed the ATT channel",
-                ))
-            } else {
-                let e = unsafe { errno() };
-                if e == EAGAIN || e == EINTR {
-                    // SO_RCVTIMEO elapsed — surfaced as WouldBlock so a notify
-                    // loop treats it as "no event yet" rather than a fatal error.
-                    Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "ATT recv timed out",
-                    ))
-                } else {
-                    Err(io::Error::from_raw_os_error(e))
-                }
+                )),
+                Ok(n) => Ok(buf[..n].to_vec()),
+                // The receive timeout elapsed, or a signal cut the wait short.
+                // Both mean "no PDU yet", which a notify loop treats as a quiet
+                // tick rather than an error.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "ATT recv interrupted",
+                )),
+                Err(e) => Err(e),
             }
         }
     }

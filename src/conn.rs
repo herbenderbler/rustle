@@ -259,8 +259,6 @@ impl From<CommandError> for RssiError {
 #[cfg(target_os = "linux")]
 pub use linux_impl::{connections, read_rssi};
 
-/// Read the RSSI of an established LE connection. This platform has no raw
-/// HCI socket, so this always fails with [`RssiError::Unsupported`].
 /// List the connections established on an adapter. This platform has no HCI
 /// ioctl interface, so this always fails.
 #[cfg(not(target_os = "linux"))]
@@ -268,6 +266,8 @@ pub fn connections(_dev: u16) -> Result<Vec<ConnInfo>, String> {
     Err("connection listing is only supported on Linux".to_string())
 }
 
+/// Read the RSSI of an established LE connection. This platform has no raw
+/// HCI socket, so this always fails with [`RssiError::Unsupported`].
 #[cfg(not(target_os = "linux"))]
 pub fn read_rssi(_dev: u16, _peer: &str, _recv_timeout: Duration) -> Result<Option<i8>, RssiError> {
     Err(RssiError::Unsupported)
@@ -278,18 +278,8 @@ mod linux_impl {
     use super::*;
     use crate::hci::{HCI_EV_CMD_COMPLETE, HCI_EV_CMD_STATUS};
     use crate::l2cap::mac_str_to_le;
-    use crate::sys::{
-        bind, errno, ioctl, set_recv_timeout, setsockopt, socket, FdGuard, Timeval, AF_BLUETOOTH,
-        BTPROTO_HCI, SOCK_RAW,
-    };
-    use std::os::raw::{c_int, c_ulong, c_void};
-
-    // The raw HCI channel and its filter option, as in [`crate::scan`]'s
-    // socket layer; this module owns its own copies so the two stay
-    // independently readable.
-    const HCI_CHANNEL_RAW: u16 = 0;
-    const SOL_HCI: c_int = 0;
-    const HCI_FILTER: c_int = 2;
+    use crate::sys::{ioctl, Socket, HCI_CHANNEL_RAW};
+    use std::os::raw::{c_ulong, c_void};
 
     /// BlueZ ioctl `_IOR('H', 213, int)` in the asm-generic `_IOC` encoding
     /// shared by x86 / arm / arm64 / riscv (see [`crate::adapter`] for the
@@ -298,41 +288,17 @@ mod linux_impl {
     /// Its list-everything sibling, `_IOR('H', 212, int)`.
     const HCIGETCONNLIST: c_ulong = 0x8004_48D4;
 
-    #[repr(C)]
-    struct SockaddrHci {
-        hci_family: u16,
-        hci_dev: u16,
-        hci_channel: u16,
-    }
-
-    #[repr(C)]
-    struct HciFilter {
-        type_mask: u32,
-        event_mask: [u32; 2],
-        opcode: u16,
-        // Explicit trailing pad, as in the scanner's copy: the two padding
-        // bytes handed to setsockopt stay initialized.
-        _pad: u16,
-    }
-
     /// List the connections currently established on adapter `dev` via
     /// `HCIGETCONNLIST`. The kernel answers from its own state: no HCI
     /// command is sent and the connections themselves are untouched.
     pub fn connections(dev: u16) -> Result<Vec<ConnInfo>, String> {
-        let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
-        if fd < 0 {
-            return Err(format!(
-                "cannot open HCI control socket (errno {}); is Bluetooth in the kernel?",
-                unsafe { errno() }
-            ));
-        }
-        let _guard = FdGuard(fd);
+        let sock = crate::adapter::control_socket()?;
         let mut buf = conn_list_request(dev);
-        let rc = unsafe { ioctl(fd, HCIGETCONNLIST, buf.as_mut_ptr() as *mut c_void) };
+        let rc = unsafe { ioctl(sock.fd(), HCIGETCONNLIST, buf.as_mut_ptr() as *mut c_void) };
         if rc < 0 {
             return Err(format!(
-                "HCIGETCONNLIST failed for hci{dev} (errno {})",
-                unsafe { errno() }
+                "HCIGETCONNLIST failed for hci{dev}: {}",
+                io::Error::last_os_error()
             ));
         }
         Ok(parse_conn_list(&buf))
@@ -354,67 +320,30 @@ mod linux_impl {
     ) -> Result<Option<i8>, RssiError> {
         let peer_le = mac_str_to_le(peer).ok_or_else(|| RssiError::BadPeer(peer.to_string()))?;
 
-        let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
-        if fd < 0 {
-            return Err(RssiError::Socket(io::Error::last_os_error()));
-        }
-        let mut sock = FdGuard(fd);
-
-        let addr = SockaddrHci {
-            hci_family: AF_BLUETOOTH as u16,
-            hci_dev: dev,
-            hci_channel: HCI_CHANNEL_RAW,
-        };
-        let rc = unsafe {
-            bind(
-                fd,
-                &addr as *const SockaddrHci as *const c_void,
-                std::mem::size_of::<SockaddrHci>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(RssiError::Bind(io::Error::last_os_error()));
-        }
-
+        let mut sock = Socket::hci().map_err(RssiError::Socket)?;
+        sock.bind_hci(dev, HCI_CHANNEL_RAW)
+            .map_err(RssiError::Bind)?;
         // Receive event packets, but only Command Complete (0x0E) and Command
         // Status (0x0F). The kernel tests the event code against event_mask
         // bit by bit, so accepting everything would deliver advertising
         // reports too when the adapter is scanning, and a flood of them could
         // exhaust the bounded wait below before the completion arrives.
-        let filter = HciFilter {
-            type_mask: 1 << 4,
-            event_mask: [
-                (1u32 << HCI_EV_CMD_COMPLETE) | (1u32 << HCI_EV_CMD_STATUS),
-                0,
-            ],
-            opcode: 0,
-            _pad: 0,
-        };
-        let rc = unsafe {
-            setsockopt(
-                fd,
-                SOL_HCI,
-                HCI_FILTER,
-                &filter as *const HciFilter as *const c_void,
-                std::mem::size_of::<HciFilter>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(RssiError::Filter(io::Error::last_os_error()));
-        }
-
-        let rc = set_recv_timeout(fd, &Timeval::from_duration(recv_timeout));
-        if rc < 0 {
-            return Err(RssiError::RecvTimeout(io::Error::last_os_error()));
-        }
+        sock.set_hci_event_filter([
+            (1u32 << HCI_EV_CMD_COMPLETE) | (1u32 << HCI_EV_CMD_STATUS),
+            0,
+        ])
+        .map_err(RssiError::Filter)?;
+        sock.set_recv_timeout(recv_timeout)
+            .map_err(RssiError::RecvTimeout)?;
 
         // Ask the kernel for the connection's handle.
         let mut info = conn_info_request(peer_le);
-        let rc = unsafe { ioctl(fd, HCIGETCONNINFO, info.as_mut_ptr() as *mut c_void) };
+        let rc = unsafe { ioctl(sock.fd(), HCIGETCONNINFO, info.as_mut_ptr() as *mut c_void) };
         if rc < 0 {
             return Err(RssiError::NoConnection(io::Error::last_os_error()));
         }
-        let handle = parse_conn_info_handle(&info).ok_or(RssiError::NoResponse)?;
+        let handle = parse_conn_info_handle(&info)
+            .expect("conn_info_request sizes the buffer to hold the handle");
 
         // Ask the controller for the RSSI on that handle. The wait is bounded
         // to a handful of reads, each limited by the receive timeout.

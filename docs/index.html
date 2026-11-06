@@ -15,10 +15,7 @@
     --dim: #6f655c;
     --border: #2e2823;
     --orange: #e3844a;
-    --orange-dim: rgba(227, 132, 74, 0.16);
     --blue: #9ec0ea;
-    --blue-dim: rgba(158, 192, 234, 0.14);
-    --ok: #b7d3a8;
     --sans: "Avenir Next", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
     --mono: "SF Mono", ui-monospace, "IBM Plex Mono", Menlo, Consolas, monospace;
   }
@@ -86,7 +83,6 @@
   .panel.air { border-top: 3px solid var(--orange); }
   .panel.out { border-top: 3px solid var(--blue); }
   .hex { font: 0.84rem/1.55 var(--mono); color: var(--fg); word-break: break-all; margin: 0; white-space: pre-wrap; }
-  .hex .nm { color: var(--orange); }
   dl { margin: 0; }
   .row { display: grid; grid-template-columns: 7.2rem 1fr; gap: 0.4rem; padding: 0.28rem 0; border-top: 1px solid var(--border); font: 0.86rem var(--mono); }
   .need .row:first-child { border-top: 0; padding-top: 0; }
@@ -575,36 +571,28 @@ target/debug/examples/battery Polar</code></div>
     ["70:C9:4E:AA:BB:CC -48 dBm FS\n", "s"]
   ];
   var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  function paint(done) {
+  function escHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  }
+  var flat = script.map(function (p) { return p[0]; }).join("");
+  // Paint the first n characters of the script, keeping each part's colour.
+  function paint(n) {
     var html = "";
-    script.forEach(function (part, i) {
-      if (i > done) return;
-      var text = i < done ? part[0] : part[0];
-      html += '<span class="' + part[1] + '">' + text.replace(/&/g, "&amp;").replace(/</g, "&lt;") + "</span>";
+    script.forEach(function (p) {
+      var take = Math.min(p[0].length, n);
+      n -= take;
+      if (take) html += '<span class="' + p[1] + '">' + escHtml(p[0].slice(0, take)) + "</span>";
     });
     term.innerHTML = html + '<span class="caret"></span>';
   }
   if (reduce) {
-    var all = "";
-    script.forEach(function (p) { all += '<span class="' + p[1] + '">' + p[0].replace(/&/g, "&amp;").replace(/</g, "&lt;") + "</span>"; });
-    term.innerHTML = all + '<span class="caret"></span>';
+    paint(flat.length);
   } else {
-    var flat = "";
-    script.forEach(function (p) { flat += p[0]; });
-    var n = 0;
-    function tick() {
-      n++;
-      var html = "";
-      var left = n;
-      script.forEach(function (p) {
-        var take = Math.max(0, Math.min(p[0].length, left));
-        left -= take;
-        if (take) html += '<span class="' + p[1] + '">' + p[0].slice(0, take).replace(/&/g, "&amp;").replace(/</g, "&lt;") + "</span>";
-      });
-      term.innerHTML = html + '<span class="caret"></span>';
-      if (n < flat.length) setTimeout(tick, flat[n - 1] === "\n" ? 280 : 18);
-    }
-    tick();
+    var typedSoFar = 0;
+    (function tick() {
+      paint(++typedSoFar);
+      if (typedSoFar < flat.length) setTimeout(tick, flat[typedSoFar - 1] === "\n" ? 280 : 18);
+    })();
   }
 
   var scenes = document.querySelectorAll(".scene");
@@ -619,7 +607,7 @@ target/debug/examples/battery Polar</code></div>
       li.classList.toggle("on", on);
     });
     items.forEach(function (li, i) { li.classList.toggle("past", idx > -1 && i < idx); });
-    if (idx > -1) fill.style.height = (items.length === 1 ? 0 : (idx / (items.length - 1)) * 100) + "%";
+    if (idx > -1) fill.style.height = (idx / (items.length - 1)) * 100 + "%";
   }
   items.forEach(function (li) {
     function go() {
@@ -631,6 +619,7 @@ target/debug/examples/battery Polar</code></div>
     li.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
   });
   var rail = document.getElementById("rail");
+  var scrolly = document.getElementById("scrolly");
   if ("IntersectionObserver" in window) {
     var io = new IntersectionObserver(function (entries) {
       entries.forEach(function (e) {
@@ -640,7 +629,6 @@ target/debug/examples/battery Polar</code></div>
     document.querySelectorAll(".ch").forEach(function (ch) { io.observe(ch); });
   }
   function onScroll() {
-    var scrolly = document.getElementById("scrolly");
     var box = scrolly.getBoundingClientRect();
     rail.classList.toggle("on", box.top < window.innerHeight * 0.72 && box.bottom > window.innerHeight * 0.45);
   }
@@ -659,22 +647,20 @@ target/debug/examples/battery Polar</code></div>
   var active = false;
   var trunc = false;
 
+  var RSSI = 0xd0;
+  function byteHex(b) {
+    return b.toString(16).toUpperCase().padStart(2, "0");
+  }
   function hex(bytes) {
-    return bytes.map(function (b) { return b.toString(16).toUpperCase().padStart(2, "0"); }).join(" ");
+    return bytes.map(byteHex).join(" ");
   }
-  function formatAddr(le) {
-    return le.slice().reverse().map(function (b) { return b.toString(16).toUpperCase().padStart(2, "0"); }).join(":");
-  }
-  function rssi(b) {
-    if (b === 0x7f) return null;
-    return (b << 24) >> 24;
-  }
+  // HCI sends the address least significant byte first; display reverses it.
+  var ADDR_TEXT = ADDR.slice().reverse().map(byteHex).join(":");
   function parseName(data) {
     var i = 0;
     var name = null;
     while (i < data.length) {
       var len = data[i];
-      if (len === 0) break;
       if (i + 1 + len > data.length) break;
       var type = data[i + 1];
       var value = data.slice(i + 2, i + 1 + len);
@@ -686,10 +672,11 @@ target/debug/examples/battery Polar</code></div>
   // Legacy advertising data is at most 31 bytes, so one name structure
   // (length byte + type byte + name) holds at most 29 bytes of name.
   var NAME_MAX = 29;
-  function clip(text) {
+  // The longest prefix of text that fits in max bytes of UTF-8.
+  function prefixBytes(text, max) {
     var s = "";
     Array.from(text).every(function (ch) {
-      if (enc.encode(s + ch).length > NAME_MAX) return false;
+      if (enc.encode(s + ch).length > max) return false;
       s += ch;
       return true;
     });
@@ -699,44 +686,22 @@ target/debug/examples/battery Polar</code></div>
     var raw = Array.from(enc.encode(text));
     return [raw.length + 1, type].concat(raw);
   }
-  function shorter(name) {
-    var full = enc.encode(name).length;
-    if (full <= 4) return name;
-    var chars = Array.from(name);
-    var s = "";
-    for (var i = 0; i < chars.length - 1; i++) {
-      var next = s + chars[i];
-      if (enc.encode(next).length > 4) break;
-      s = next;
-    }
-    if (!s) s = chars[0] || "";
-    if (enc.encode(s).length >= full) return chars[0] || "";
-    return s;
-  }
-  function longer(a, b) {
-    if (a == null) return b;
-    if (b == null) return a;
-    return enc.encode(b).length > enc.encode(a).length ? b : a;
-  }
   function eventOf(ad) {
     // num_reports 1, event_type 00 (ADV_IND), addr_type 00 (public).
-    var report = [0x01, 0x00, 0x00].concat(ADDR, [ad.length], ad, [0xd0]);
+    var report = [0x01, 0x00, 0x00].concat(ADDR, [ad.length], ad, [RSSI]);
     var sub = [0x02].concat(report);
     return [0x04, 0x3e, sub.length].concat(sub);
-  }
-  function escHtml(s) {
-    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
   }
   function row(k, v) {
     return '<div class="row"><dt>' + escHtml(k) + '</dt><dd>' + escHtml(v) + '</dd></div>';
   }
   function paintTry() {
-    var typed = clip(nameEl.value);
+    var typed = prefixBytes(nameEl.value, NAME_MAX);
     var clipped = typed !== nameEl.value;
     var primaryAd, responseAd, shown, detail;
     if (trunc) {
       var raw = Array.from(enc.encode(typed || "X"));
-      var claim = Math.min(255, raw.length + 1 + 8);
+      var claim = raw.length + 1 + 8;
       primaryAd = [claim, 0x09].concat(raw);
       shown = parseName(primaryAd);
       detail = "The length byte says " + claim + " bytes follow it. Only " + (raw.length + 1) + " do, so the structure is cut off and the name is dropped.";
@@ -747,13 +712,14 @@ target/debug/examples/battery Polar</code></div>
       detail = "No AD bytes. local_name stays absent.";
       wireEl.textContent = hex(eventOf(primaryAd));
     } else if (active) {
-      var shortName = shorter(typed);
-      primaryAd = adOf(shortName, 0x08);
+      // A primary carries at most a four-byte shortened name. No UTF-8
+      // character is longer than four bytes, so that prefix is never empty.
+      primaryAd = adOf(prefixBytes(typed, 4), 0x08);
       responseAd = adOf(typed, 0x09);
       var a = parseName(primaryAd);
       var b = parseName(responseAd);
-      shown = longer(a, b);
-      detail = "Primary local_name is " + (a || "absent") + " (" + enc.encode(a || "").length + " bytes). Scan response is " + b + " (" + enc.encode(b).length + " bytes). The longer one is kept. A tie would have kept the primary.";
+      shown = enc.encode(b).length > enc.encode(a).length ? b : a;
+      detail = "Primary local_name is " + a + " (" + enc.encode(a).length + " bytes). Scan response is " + b + " (" + enc.encode(b).length + " bytes). The longer one is kept. A tie would have kept the primary.";
       wireEl.textContent = "ADV_IND  " + hex(primaryAd) + "\nSCAN_RSP  " + hex(responseAd);
     } else {
       primaryAd = adOf(typed, 0x09);
@@ -761,12 +727,13 @@ target/debug/examples/battery Polar</code></div>
       detail = "One complete-local-name structure. Length counts the type byte plus the name.";
       wireEl.textContent = hex(eventOf(primaryAd));
     }
-    var merged = active && !trunc && !!typed;
+    // Active and Truncate are exclusive, so active already implies !trunc.
+    var merged = active && !!typed;
     var lines = [
       row("type", merged ? "MergedAdv" : "AdvReport"),
-      row("address", formatAddr(ADDR)),
+      row("address", ADDR_TEXT),
       row("addr_type", "Public"),
-      row("rssi", "Some(" + rssi(0xd0) + ")")
+      row("rssi", "Some(" + ((RSSI << 24) >> 24) + ")")
     ];
     // A MergedAdv has no pdu field: the merge already consumed it.
     if (!merged) lines.push(row("pdu", "ScannablePrimary"));

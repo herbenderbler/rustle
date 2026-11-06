@@ -15,8 +15,8 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// One advertisement ready for the detection path — either a standalone report or
-/// a scannable primary already merged with its `SCAN_RSP`.
+/// One advertisement ready for the caller: either a standalone report or a
+/// scannable primary already merged with its `SCAN_RSP`.
 #[derive(Debug, PartialEq)]
 pub struct MergedAdv {
     pub address: String,
@@ -228,8 +228,8 @@ mod tests {
             .offer(report("AA", AdvPdu::ScannablePrimary, None, &["u1"]), now)
             .is_empty());
         // A new primary for the same device before any response: folded into the
-        // held one (not emitted alone), so a signal-less first advert can't lock
-        // the MAC before the response confirms it. Nothing is emitted yet.
+        // held one (not emitted alone), so a caller never sees the first advert
+        // without the response that completes it. Nothing is emitted yet.
         let out = m.offer(
             report("AA", AdvPdu::ScannablePrimary, Some("two"), &["u2"]),
             now,

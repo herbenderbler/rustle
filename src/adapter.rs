@@ -117,6 +117,8 @@ pub fn index_from_name(name: &str) -> Option<u16> {
 // ===========================================================================
 
 #[cfg(target_os = "linux")]
+pub(crate) use linux_impl::control_socket;
+#[cfg(target_os = "linux")]
 pub use linux_impl::{enumerate, info};
 
 /// Enumerate the host's Bluetooth adapters. This platform has no HCI ioctl
@@ -136,7 +138,8 @@ pub fn info(_dev: u16) -> Result<AdapterInfo, String> {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::*;
-    use crate::sys::{close, errno, ioctl, socket, AF_BLUETOOTH, BTPROTO_HCI, SOCK_RAW};
+    use crate::sys::{ioctl, Socket};
+    use std::io;
     use std::os::raw::{c_ulong, c_void};
 
     // BlueZ ioctl request numbers, `_IOR('H', 210/211, int)`, using the
@@ -157,27 +160,31 @@ mod linux_impl {
     // are read back).
     const DEV_INFO_BUF: usize = 256;
 
+    /// An unbound raw HCI socket, which is all the adapter and connection
+    /// ioctls need.
+    pub(crate) fn control_socket() -> Result<Socket, String> {
+        Socket::hci().map_err(|e| {
+            format!("cannot open HCI control socket ({e}); is Bluetooth in the kernel?")
+        })
+    }
+
     /// Enumerate the host's Bluetooth adapters via `HCIGETDEVLIST` +
     /// `HCIGETDEVINFO`. Adapters whose per-device query fails (e.g. one removed
     /// between the list and the info call) are skipped rather than failing the
     /// whole enumeration.
     pub fn enumerate() -> Result<Vec<AdapterInfo>, String> {
-        let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
-        if fd < 0 {
-            return Err(format!(
-                "cannot open HCI control socket (errno {}); is Bluetooth in the kernel?",
-                unsafe { errno() }
-            ));
-        }
+        let sock = control_socket()?;
+        let fd = sock.fd();
 
         // Device-id list: dev_num (in) = capacity, (out) = actual count.
         let mut list = vec![0u8; DEV_LIST_HDR + HCI_MAX_DEV * DEV_REQ_SIZE];
         list[0..2].copy_from_slice(&(HCI_MAX_DEV as u16).to_le_bytes());
         let rc = unsafe { ioctl(fd, HCIGETDEVLIST, list.as_mut_ptr() as *mut c_void) };
         if rc < 0 {
-            let e = unsafe { errno() };
-            unsafe { close(fd) };
-            return Err(format!("HCIGETDEVLIST failed (errno {e})"));
+            return Err(format!(
+                "HCIGETDEVLIST failed: {}",
+                io::Error::last_os_error()
+            ));
         }
         let count = u16::from_le_bytes([list[0], list[1]]).into();
 
@@ -201,8 +208,6 @@ mod linux_impl {
                 }
             })
             .collect();
-
-        unsafe { close(fd) };
         Ok(out)
     }
 
@@ -210,20 +215,15 @@ mod linux_impl {
     /// without enumerating: the address and the up/running flags as they are
     /// right now.
     pub fn info(dev: u16) -> Result<AdapterInfo, String> {
-        let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
-        if fd < 0 {
-            return Err(format!(
-                "cannot open HCI control socket (errno {}); is Bluetooth in the kernel?",
-                unsafe { errno() }
-            ));
-        }
+        let sock = control_socket()?;
         let mut buf = vec![0u8; DEV_INFO_BUF];
         buf[0..2].copy_from_slice(&dev.to_le_bytes());
-        let rc = unsafe { ioctl(fd, HCIGETDEVINFO, buf.as_mut_ptr() as *mut c_void) };
-        let e = unsafe { errno() };
-        unsafe { close(fd) };
+        let rc = unsafe { ioctl(sock.fd(), HCIGETDEVINFO, buf.as_mut_ptr() as *mut c_void) };
         if rc < 0 {
-            return Err(format!("HCIGETDEVINFO failed for hci{dev} (errno {e})"));
+            return Err(format!(
+                "HCIGETDEVINFO failed for hci{dev}: {}",
+                io::Error::last_os_error()
+            ));
         }
         parse_dev_info(&buf).ok_or_else(|| format!("short hci_dev_info for hci{dev}"))
     }
@@ -320,7 +320,7 @@ mod tests {
     fn choose_prefers_the_named_interface() {
         assert_eq!(choose(&adapters(), "hci1"), (1, true));
         assert_eq!(choose(&adapters(), "hci0"), (0, true));
-        // Case-insensitive, matching the interact-path selector.
+        // Case-insensitive: "HCI1" names the same adapter as "hci1".
         assert_eq!(choose(&adapters(), "HCI1"), (1, true));
     }
 

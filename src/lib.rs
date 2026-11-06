@@ -21,7 +21,7 @@
 //! | [`scan`] | scan parameters and their wire encodings | [`scan::HciScanner`]: a raw HCI socket programmed for passive or active LE scanning |
 //! | [`scan_merge`] | pairs a scannable advertisement with its `SCAN_RSP` | — |
 //! | [`scan_filter`] | [`scan_filter::ScanFilter`]: client-side matching of decoded advertisements | — |
-//! | [`adapter`] | `hci_dev_info` decoding, adapter selection | [`adapter::enumerate`]: `HCIGETDEVLIST` / `HCIGETDEVINFO` |
+//! | [`adapter`] | `hci_dev_info` decoding, adapter selection | [`adapter::enumerate`] and [`adapter::info`]: `HCIGETDEVLIST` / `HCIGETDEVINFO` |
 //! | [`att`] | ATT PDU encoder / decoder | — |
 //! | [`gatt`] | GATT declarations, properties, CCCD values | — |
 //! | [`client`] | [`client::GattClient`], generic over an [`client::AttIo`] transport | — |

@@ -17,29 +17,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
-# bluez brings btmgmt, btmon and bluetoothctl. rfkill unblocks a radio.
-# libcap2-bin brings setcap, to try the capability steps as a normal user.
-# usbutils brings lsusb, to find a USB dongle. The rest builds Rust code and
-# fetches rustup.
+# bluez brings btmgmt and btmon. usbutils brings lsusb, to find a USB
+# dongle. The rest builds Rust code and fetches rustup.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bluez \
         build-essential \
         ca-certificates \
         curl \
-        libcap2-bin \
-        rfkill \
         usbutils \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" \
-        --component rustfmt,clippy
+    | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"
 
 WORKDIR /src
 COPY . .
 
-# Build the library, the tests and both examples now, so a container starts
+# Build the library, the tests and the three examples now, so a container starts
 # with everything ready to run.
 RUN cargo build --locked --all-targets
 
