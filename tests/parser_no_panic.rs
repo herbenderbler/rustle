@@ -1,16 +1,17 @@
-//! Adversarial-input no-panic harness for the BLE byte parsers.
+//! Checks that the byte parsers never panic on hostile input.
 //!
-//! The whole point of the in-house stack is that attacker-controlled
-//! advertisement / ATT bytes are decoded in **safe Rust** rather than in a C
-//! library behind a D-Bus binding. "Safe" still requires that a
-//! malformed frame can't *panic* — an unhandled slice index or arithmetic
-//! overflow on a hostile advertisement would be a remote DoS of the scanner. So
-//! this feeds a large, deterministic mix of random and seed-mutated byte strings
-//! through every public parse entry point and asserts none of them panic.
+//! rustle decodes advertisements and ATT PDUs sent by devices it does not
+//! control. The parsers are safe Rust, but safe code can still panic when a
+//! slice index is out of bounds or an integer overflows. A nearby device could
+//! send such bytes on purpose and crash the program that scans or connects.
 //!
-//! This is the always-on, **stable-toolchain** complement to the coverage-guided
-//! `cargo fuzz` targets under `fuzz/` (which need nightly): those
-//! explore deeper, this one gates every PR. See `fuzz/README.md`.
+//! This test feeds every public parser a large mix of random bytes and
+//! mutated copies of valid frames. It uses a fixed seed, so a failure can be
+//! reproduced. A panic in any parser fails the test.
+//!
+//! The test needs only the stable toolchain and runs on every CI build. The
+//! `cargo fuzz` targets in `fuzz/` search deeper, but they need nightly Rust.
+//! See `fuzz/README.md`.
 
 use rustle::{att, conn, hci, mgmt};
 

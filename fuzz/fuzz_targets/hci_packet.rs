@@ -1,10 +1,10 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
-// The top-level HCI datagram parser — the exact function the raw-HCI scanner
-// feeds untrusted socket bytes into (`ble_hci::run_read_loop`). It dispatches to
-// the legacy and extended LE-Advertising-Report parsers and the AD-structure
-// decoder, so this one target exercises most of the scan decode surface.
+// The top-level HCI packet parser. Callers feed it each datagram that
+// `HciScanner::read` returns. It hands legacy and extended advertising reports
+// to their parsers and to the advertising data decoder, so this one target
+// covers most of the scan decoding.
 fuzz_target!(|data: &[u8]| {
     let _ = rustle::hci::parse_hci_packet(data);
 });
