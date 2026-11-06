@@ -49,20 +49,14 @@ impl SecurityLevel {
 /// BlueZ sockaddr expects (least-significant byte first — the reverse of the
 /// display order). Returns `None` on a malformed address.
 pub fn mac_str_to_le(mac: &str) -> Option<[u8; 6]> {
+    let mut octets = mac.split(':');
     let mut out = [0u8; 6];
-    let mut count = 0usize;
-    for (i, part) in mac.split(':').enumerate() {
-        if i >= 6 {
-            return None; // too many octets
-        }
-        out[5 - i] = u8::from_str_radix(part, 16).ok()?;
-        count += 1;
+    // The display form leads with the most significant octet, which goes last.
+    for slot in out.iter_mut().rev() {
+        *slot = u8::from_str_radix(octets.next()?, 16).ok()?;
     }
-    if count == 6 {
-        Some(out)
-    } else {
-        None
-    }
+    // Exactly six octets: a seventh is malformed.
+    octets.next().is_none().then_some(out)
 }
 
 // ===========================================================================

@@ -95,25 +95,27 @@ pub fn conn_list_request(dev: u16) -> Vec<u8> {
 /// the header; a count past the buffer's end, or a truncated trailing entry,
 /// stops the decode rather than reading out of bounds.
 pub fn parse_conn_list(buf: &[u8]) -> Vec<ConnInfo> {
-    let count = match buf.get(2..4) {
-        Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize,
-        None => return Vec::new(),
+    // dev_id(2) conn_num(2), then the entries.
+    let Some((&[_, _, n0, n1], entries)) = buf.split_first_chunk::<CONN_LIST_HDR>() else {
+        return Vec::new();
     };
-    let mut out = Vec::new();
-    for i in 0..count {
-        let off = CONN_LIST_HDR + i * CONN_INFO_LEN;
-        let entry = match buf.get(off..off + CONN_INFO_LEN) {
-            Some(e) => e,
-            None => break,
-        };
-        out.push(ConnInfo {
-            handle: u16::from_le_bytes([entry[0], entry[1]]),
-            address: format_addr_le(&entry[2..8]),
-            le: entry[8] == LE_LINK,
-            outgoing: entry[9] != 0,
-        });
-    }
-    out
+    let count = u16::from_le_bytes([n0, n1]).into();
+    entries
+        .as_chunks::<CONN_INFO_LEN>()
+        .0
+        .iter()
+        .take(count)
+        .map(|entry| {
+            // handle(2) bdaddr(6) type(1) out(1) state(2) link_mode(4)
+            let &[h0, h1, a0, a1, a2, a3, a4, a5, link_type, out, ..] = entry;
+            ConnInfo {
+                handle: u16::from_le_bytes([h0, h1]),
+                address: format_addr_le(&[a0, a1, a2, a3, a4, a5]),
+                le: link_type == LE_LINK,
+                outgoing: out != 0,
+            }
+        })
+        .collect()
 }
 
 /// A decoded Read RSSI Command Complete event.

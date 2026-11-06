@@ -94,15 +94,13 @@ pub fn parse_characteristics(entries: &[(u16, Vec<u8>)]) -> Vec<Characteristic> 
     entries
         .iter()
         .filter_map(|(decl_handle, value)| {
-            // props(1) + value_handle(2) + at least a 16-bit UUID(2)
-            if value.len() < 5 {
-                return None;
-            }
+            // props(1) + value_handle(2), then a 16- or 128-bit UUID
+            let (&[properties, h0, h1], uuid) = value.split_first_chunk::<3>()?;
             Some(Characteristic {
                 decl_handle: *decl_handle,
-                properties: value[0],
-                value_handle: u16::from_le_bytes([value[1], value[2]]),
-                uuid: att::uuid_from_le(&value[3..])?,
+                properties,
+                value_handle: u16::from_le_bytes([h0, h1]),
+                uuid: att::uuid_from_le(uuid)?,
             })
         })
         .collect()

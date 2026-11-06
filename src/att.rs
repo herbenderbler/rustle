@@ -73,26 +73,22 @@ pub const ERR_INSUFFICIENT_ENCRYPTION: u8 = 0x0F;
 /// base range) nor a full 128-bit UUID.
 fn uuid_to_le(uuid: &str) -> Option<Vec<u8>> {
     let hex: String = uuid.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
+    // Checking the digits first keeps `from_str_radix` from accepting a sign,
+    // and makes the byte length a digit count.
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let mut bytes = [0u8; 16];
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    // 16-bit shorthand when the UUID is in the Bluetooth Base range
-    // (0000xxxx-0000-1000-8000-00805f9b34fb).
-    const BASE_SUFFIX: [u8; 12] = [
-        0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb,
-    ];
-    if bytes[0..2] == [0x00, 0x00] && bytes[4..16] == BASE_SUFFIX {
-        // 16-bit value sits in bytes[2..4] (big-endian in the string); emit LE.
-        Some(vec![bytes[3], bytes[2]])
+    let value = u128::from_str_radix(&hex, 16).ok()?;
+    // The Bluetooth Base UUID, 00000000-0000-1000-8000-00805f9b34fb. A UUID
+    // that matches it outside the 16-bit field (the `xxxx` of
+    // 0000xxxx-0000-1000-8000-00805f9b34fb) has a 16-bit shorthand.
+    const BASE: u128 = 0x0000_0000_0000_1000_8000_0080_5f9b_34fb;
+    const SHORT_FIELD: u128 = 0xffff << 96;
+    if value & !SHORT_FIELD == BASE {
+        Some(((value >> 96) as u16).to_le_bytes().to_vec())
     } else {
         // Full 128-bit, little-endian (reverse of the display order).
-        let mut le = bytes;
-        le.reverse();
-        Some(le.to_vec())
+        Some(value.to_le_bytes().to_vec())
     }
 }
 
@@ -215,21 +211,17 @@ pub fn parse(buf: &[u8]) -> Option<AttPdu> {
     match opcode {
         OP_ERROR_RSP => {
             // req_opcode(1) handle(2) error(1)
-            if rest.len() < 4 {
-                return None;
-            }
+            let &[req_opcode, h0, h1, error] = rest.first_chunk::<4>()?;
             Some(AttPdu::ErrorResponse {
-                req_opcode: rest[0],
-                handle: u16::from_le_bytes([rest[1], rest[2]]),
-                error: rest[3],
+                req_opcode,
+                handle: u16::from_le_bytes([h0, h1]),
+                error,
             })
         }
         OP_EXCHANGE_MTU_RSP => {
-            if rest.len() < 2 {
-                return None;
-            }
+            let &mtu = rest.first_chunk::<2>()?;
             Some(AttPdu::ExchangeMtuResponse {
-                mtu: u16::from_le_bytes([rest[0], rest[1]]),
+                mtu: u16::from_le_bytes(mtu),
             })
         }
         OP_FIND_INFORMATION_RSP => parse_find_information(rest),
@@ -243,25 +235,44 @@ pub fn parse(buf: &[u8]) -> Option<AttPdu> {
         }),
         OP_WRITE_RSP => Some(AttPdu::WriteResponse),
         OP_HANDLE_VALUE_NTF => {
-            if rest.len() < 2 {
-                return None;
-            }
-            Some(AttPdu::HandleValueNotification {
-                handle: u16::from_le_bytes([rest[0], rest[1]]),
-                value: rest[2..].to_vec(),
-            })
+            let (handle, value) = handle_value(rest)?;
+            Some(AttPdu::HandleValueNotification { handle, value })
         }
         OP_HANDLE_VALUE_IND => {
-            if rest.len() < 2 {
-                return None;
-            }
-            Some(AttPdu::HandleValueIndication {
-                handle: u16::from_le_bytes([rest[0], rest[1]]),
-                value: rest[2..].to_vec(),
-            })
+            let (handle, value) = handle_value(rest)?;
+            Some(AttPdu::HandleValueIndication { handle, value })
         }
         _ => None,
     }
+}
+
+/// The `handle(2) value(..)` body of a Handle Value Notification or
+/// Indication.
+fn handle_value(rest: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let (&handle, value) = rest.split_first_chunk::<2>()?;
+    Some((u16::from_le_bytes(handle), value.to_vec()))
+}
+
+/// Decode a list of fixed-width entries, `width` bytes each, every one an
+/// `N`-byte head and the bytes after it. A trailing partial entry is
+/// dropped. `None` when `width` is too short to hold the head, or when
+/// `entry` rejects one.
+fn fixed_entries<const N: usize, T>(
+    list: &[u8],
+    width: usize,
+    entry: impl Fn(&[u8; N], &[u8]) -> Option<T>,
+) -> Option<Vec<T>> {
+    // A head of at least one byte keeps `chunks_exact` off a zero width.
+    const { assert!(N > 0, "fixed_entries needs a non-empty head") };
+    if width < N {
+        return None;
+    }
+    list.chunks_exact(width)
+        .map(|chunk| {
+            let (head, tail) = chunk.split_first_chunk::<N>()?;
+            entry(head, tail)
+        })
+        .collect()
 }
 
 /// Format bytes (`0x01` = 16-bit UUIDs, `0x02` = 128-bit), then fixed-width
@@ -269,71 +280,41 @@ pub fn parse(buf: &[u8]) -> Option<AttPdu> {
 fn parse_find_information(rest: &[u8]) -> Option<AttPdu> {
     let (&format, list) = rest.split_first()?;
     let uuid_len = match format {
-        0x01 => 2usize,
-        0x02 => 16usize,
+        0x01 => 2,
+        0x02 => 16,
         _ => return None,
     };
-    let entry_len = 2 + uuid_len;
-    let mut entries = Vec::new();
-    for chunk in list.chunks(entry_len) {
-        if chunk.len() != entry_len {
-            break; // trailing truncation
-        }
-        let handle = u16::from_le_bytes([chunk[0], chunk[1]]);
-        let uuid = uuid_from_le(&chunk[2..])?;
-        entries.push((handle, uuid));
-    }
+    let entries = fixed_entries::<2, _>(list, 2 + uuid_len, |&handle, uuid| {
+        Some((u16::from_le_bytes(handle), uuid_from_le(uuid)?))
+    })?;
     Some(AttPdu::FindInformationResponse { entries })
 }
 
 /// `length(1)` then fixed-width `[handle(2), value(length-2)]` entries.
 fn parse_read_by_type(rest: &[u8]) -> Option<AttPdu> {
     let (&length, list) = rest.split_first()?;
-    let length = length as usize;
-    if length < 2 {
-        return None;
-    }
-    let mut entries = Vec::new();
-    for chunk in list.chunks(length) {
-        if chunk.len() != length {
-            break;
-        }
-        let handle = u16::from_le_bytes([chunk[0], chunk[1]]);
-        entries.push((handle, chunk[2..].to_vec()));
-    }
+    let entries = fixed_entries::<2, _>(list, length.into(), |&handle, value| {
+        Some((u16::from_le_bytes(handle), value.to_vec()))
+    })?;
     Some(AttPdu::ReadByTypeResponse { entries })
 }
 
 /// `length(1)` then fixed-width `[start(2), end(2), value(length-4)]` entries.
 fn parse_read_by_group_type(rest: &[u8]) -> Option<AttPdu> {
     let (&length, list) = rest.split_first()?;
-    let length = length as usize;
-    if length < 4 {
-        return None;
-    }
-    let mut entries = Vec::new();
-    for chunk in list.chunks(length) {
-        if chunk.len() != length {
-            break;
-        }
-        let start = u16::from_le_bytes([chunk[0], chunk[1]]);
-        let end = u16::from_le_bytes([chunk[2], chunk[3]]);
-        entries.push((start, end, chunk[4..].to_vec()));
-    }
+    let entries = fixed_entries::<4, _>(list, length.into(), |&[s0, s1, e0, e1], value| {
+        let (start, end) = (u16::from_le_bytes([s0, s1]), u16::from_le_bytes([e0, e1]));
+        Some((start, end, value.to_vec()))
+    })?;
     Some(AttPdu::ReadByGroupTypeResponse { entries })
 }
 
 /// Decode a little-endian ATT UUID field (2 or 16 bytes) to a canonical
 /// lowercase 128-bit UUID string. `None` for any other length.
 pub fn uuid_from_le(le: &[u8]) -> Option<String> {
-    match le.len() {
-        2 => Some(format_uuid16(u16::from_le_bytes([le[0], le[1]]))),
-        16 => {
-            let mut b = [0u8; 16];
-            b.copy_from_slice(le);
-            Some(format_uuid128(&b))
-        }
-        _ => None,
+    match *le {
+        [lo, hi] => Some(format_uuid16(u16::from_le_bytes([lo, hi]))),
+        _ => <&[u8; 16]>::try_from(le).ok().map(format_uuid128),
     }
 }
 
@@ -358,6 +339,25 @@ mod tests {
         assert_eq!(le.len(), 16);
         assert_eq!(le[0], 0x78); // least-significant display byte first
         assert_eq!(uuid_from_le(&le).as_deref(), Some(VENDOR));
+    }
+
+    #[test]
+    fn uuid_encoding_rejects_non_hex_strings() {
+        // 32 bytes but not 32 characters: byte 2 falls inside the first 'é'.
+        // Slicing the string two bytes at a time used to panic here.
+        let multibyte = format!("a{}b", "é".repeat(15));
+        assert_eq!(multibyte.len(), 32);
+        assert_eq!(uuid_to_le(&multibyte), None);
+        assert_eq!(read_by_type_req(0x0001, 0xFFFF, &multibyte), None);
+        // A sign is not a hex digit, though `from_str_radix` accepts one.
+        assert_eq!(uuid_to_le("+0002902-0000-1000-8000-00805f9b34fb"), None);
+        assert_eq!(uuid_to_le("0000290g-0000-1000-8000-00805f9b34fb"), None);
+        assert_eq!(uuid_to_le("2902"), None);
+        // Case does not matter.
+        assert_eq!(
+            uuid_to_le("00002902-0000-1000-8000-00805F9B34FB"),
+            Some(vec![0x02, 0x29])
+        );
     }
 
     #[test]
