@@ -80,9 +80,16 @@
 //!
 //! # Permissions
 //!
-//! The raw HCI and L2CAP sockets need `CAP_NET_RAW` (or root), and a controller
-//! that `bluetoothd` is not managing — a userland stack holding the adapter
-//! answers the scan commands with *Command Disallowed*.
+//! The raw HCI and L2CAP sockets need `CAP_NET_RAW` (or root). A raw HCI
+//! socket opens without it, but the kernel then refuses the scan commands,
+//! which surfaces as [`scan::ScanError::Write`] with
+//! [`std::io::ErrorKind::PermissionDenied`].
+//!
+//! [`scan::HciScanner`] programs the controller directly, without telling the
+//! kernel or `bluetoothd`, and turns off any scan already running on it,
+//! including one the kernel runs for `bluetoothd`. A device discovery in
+//! progress then never finishes. Run the scanner on an adapter nothing else
+//! scans on: stop `bluetoothd`, or give rustle an adapter of its own.
 
 pub mod adapter;
 pub mod att;

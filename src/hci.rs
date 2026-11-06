@@ -540,8 +540,8 @@ pub fn is_adv_report_packet(buf: &[u8]) -> bool {
 ///
 /// Used to confirm the controller actually *accepted* an HCI command (status
 /// `0x00`) rather than only that the bytes were written — so a controller that
-/// rejects the scan commands (e.g. `bluetoothd` owns the adapter) surfaces a
-/// real error instead of a silent "scan active, no detections".
+/// rejects a scan command surfaces a real error instead of a silent "scan
+/// active, no detections".
 pub fn parse_command_event(buf: &[u8]) -> Option<(u16, u8)> {
     if buf.len() < 3 || buf[0] != HCI_EVENT_PKT {
         return None;

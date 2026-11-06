@@ -8,8 +8,10 @@
 //!   tested against the Core-spec layouts with no radio.
 //! - **Linux only:** [`HciScanner`], which owns an `AF_BLUETOOTH` raw HCI socket
 //!   bound to one controller. It needs `CAP_NET_RAW` (or root) and a controller
-//!   that `bluetoothd` is not holding. On other platforms the type exists but
-//!   [`HciScanner::open`] returns [`ScanError::Unsupported`].
+//!   nothing else scans on: [`HciScanner::start`] turns off any scan already
+//!   running, including one the kernel runs for `bluetoothd`. On other
+//!   platforms the type exists but [`HciScanner::open`] returns
+//!   [`ScanError::Unsupported`].
 //!
 //! The scanner is deliberately policy-free: it hands back raw HCI datagrams.
 //! Feed each one to [`crate::hci::parse_hci_packet`] for the decoded reports
@@ -226,21 +228,28 @@ pub enum ScanMode {
     Legacy,
 }
 
-/// Why opening the socket or talking to the controller failed. The `open`
-/// stages are distinguished so a caller can give a precise hint (permissions
-/// vs. a missing adapter).
+/// Why opening the socket or talking to the controller failed. The stages are
+/// distinguished so a caller can give a precise hint: a missing adapter fails
+/// at [`ScanError::Bind`], while missing permissions and a powered-off adapter
+/// only show at the first command, as [`ScanError::Write`].
 #[derive(Debug)]
 pub enum ScanError {
-    /// `socket()` failed — usually missing `CAP_NET_RAW` / not root.
+    /// `socket()` failed, typically because the kernel has no Bluetooth
+    /// support. The raw HCI socket opens without `CAP_NET_RAW`.
     Socket(io::Error),
-    /// `bind()` to the controller index failed — the adapter is absent or down.
+    /// `bind()` to the controller index failed: there is no controller at that
+    /// index. Binding succeeds for a controller that is down.
     Bind(io::Error),
     /// Setting the HCI event filter failed; without it no events are delivered.
     Filter(io::Error),
     /// Setting the receive timeout failed.
     RecvTimeout(io::Error),
-    /// An HCI command could not be written in full.
-    ShortWrite,
+    /// An HCI command could not be written. The kernel refuses the scan
+    /// commands with [`io::ErrorKind::PermissionDenied`] when the process
+    /// lacks `CAP_NET_RAW`, and every command with
+    /// [`io::ErrorKind::NetworkDown`] when the controller is down. A partial
+    /// write is [`io::ErrorKind::WriteZero`].
+    Write(io::Error),
     /// The controller answered a command with a non-zero status (`0x01` =
     /// Unknown HCI Command, `0x0C` = Command Disallowed, …).
     Rejected { opcode: u16, status: u8 },
@@ -260,7 +269,7 @@ impl fmt::Display for ScanError {
             ScanError::Bind(e) => write!(f, "cannot bind controller ({e})"),
             ScanError::Filter(e) => write!(f, "cannot set HCI event filter ({e})"),
             ScanError::RecvTimeout(e) => write!(f, "cannot set receive timeout ({e})"),
-            ScanError::ShortWrite => write!(f, "short write to HCI socket"),
+            ScanError::Write(e) => write!(f, "cannot write HCI command ({e})"),
             ScanError::Rejected { opcode, status } => write!(
                 f,
                 "controller rejected command 0x{opcode:04x} (status 0x{status:02x})"
@@ -279,6 +288,7 @@ impl std::error::Error for ScanError {
             | ScanError::Bind(e)
             | ScanError::Filter(e)
             | ScanError::RecvTimeout(e)
+            | ScanError::Write(e)
             | ScanError::Io(e) => Some(e),
             _ => None,
         }
@@ -424,17 +434,25 @@ mod linux_impl {
         }
 
         /// Program and enable scanning. Any scan already in progress (in either
-        /// command set) is disabled first. The extended command set is tried
-        /// first; if the controller rejects it the legacy set is programmed
-        /// instead and the rejection is reported as [`ScanStart::fallback`].
-        /// An error means neither set could be *confirmed* enabled (typically
-        /// another process owns the controller); the scanner still sends the
-        /// disables on [`HciScanner::stop`] / drop, in case an enable was
-        /// accepted but its completion event lost.
+        /// command set) is disabled first. That recovers a controller left
+        /// scanning by a process that died before its scanner was dropped, but
+        /// it also stops a scan the kernel runs for `bluetoothd`, and the
+        /// kernel is not told: a device discovery in progress then never
+        /// finishes, and new ones fail with `Busy` until it is stopped
+        /// (`btmgmt stop-find`) or the adapter is power cycled.
+        ///
+        /// The extended command set is tried first; if the controller rejects
+        /// it the legacy set is programmed instead and the rejection is
+        /// reported as [`ScanStart::fallback`]. An error means neither set
+        /// could be *confirmed* enabled: a command could not be written
+        /// ([`ScanError::Write`]) or the controller refused it. The scanner
+        /// still sends the disables on [`HciScanner::stop`] / drop, in case an
+        /// enable was accepted but its completion event lost.
         pub fn start(&mut self, params: ScanParams) -> Result<ScanStart, ScanError> {
-            // Best-effort pre-clear: the status of a disable is uninteresting.
-            self.write_command(OPCODE_LE_SET_SCAN_ENABLE, &legacy_enable_params(false));
-            self.write_command(
+            // Best-effort pre-clear: the outcome of a disable is uninteresting,
+            // and a write that fails here fails again, reported, below.
+            let _ = self.write_command(OPCODE_LE_SET_SCAN_ENABLE, &legacy_enable_params(false));
+            let _ = self.write_command(
                 OPCODE_LE_SET_EXT_SCAN_ENABLE,
                 &extended_enable_params(false),
             );
@@ -480,8 +498,8 @@ mod linux_impl {
         /// on drop; calling it explicitly just makes the stop point visible.
         pub fn stop(&mut self) {
             if self.scanning {
-                self.write_command(OPCODE_LE_SET_SCAN_ENABLE, &legacy_enable_params(false));
-                self.write_command(
+                let _ = self.write_command(OPCODE_LE_SET_SCAN_ENABLE, &legacy_enable_params(false));
+                let _ = self.write_command(
                     OPCODE_LE_SET_EXT_SCAN_ENABLE,
                     &extended_enable_params(false),
                 );
@@ -518,9 +536,8 @@ mod linux_impl {
         /// by the receive timeout, so a controller that never answers can't
         /// hang the caller.
         pub fn command(&mut self, opcode: u16, params: &[u8]) -> Result<(), ScanError> {
-            if !self.write_command(opcode, params) {
-                return Err(ScanError::ShortWrite);
-            }
+            self.write_command(opcode, params)
+                .map_err(ScanError::Write)?;
             const MAX_WAIT: u32 = 8;
             let mut buf = [0u8; 512];
             for _ in 0..MAX_WAIT {
@@ -550,12 +567,22 @@ mod linux_impl {
             Err(ScanError::NoResponse)
         }
 
-        /// Write one HCI command without waiting for its completion event;
-        /// `false` on a short or failed write.
-        fn write_command(&mut self, opcode: u16, params: &[u8]) -> bool {
+        /// Write one HCI command without waiting for its completion event. The
+        /// kernel checks permissions and the controller's state at this point,
+        /// so its refusal comes back here as the `write()` error.
+        fn write_command(&mut self, opcode: u16, params: &[u8]) -> io::Result<()> {
             let pkt = build_command(opcode, params);
             let n = unsafe { write(self.fd, pkt.as_ptr() as *const c_void, pkt.len()) };
-            n == pkt.len() as isize
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else if n as usize != pkt.len() {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short write to HCI socket",
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -754,6 +781,18 @@ mod tests {
             "controller rejected command 0x2041 (status 0x01)"
         );
         assert!(ScanError::Unsupported.to_string().contains("Linux"));
+    }
+
+    #[test]
+    fn write_error_keeps_the_kernel_error() {
+        use std::error::Error as _;
+        let e = ScanError::Write(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(e.to_string().starts_with("cannot write HCI command"));
+        let source = e.source().and_then(|s| s.downcast_ref::<io::Error>());
+        assert_eq!(
+            source.map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied)
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

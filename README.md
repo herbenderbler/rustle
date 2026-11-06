@@ -24,8 +24,10 @@ here as a standalone library.
   socket permissions and freeing the adapter from `bluetoothd`.
 - [USAGE.md](USAGE.md): a walk through scanning, filtering, connecting,
   GATT reads and writes, notifications and testing without a radio.
-- Examples: `examples/scan.rs` lists nearby devices and
-  `examples/battery.rs` connects to one and reads its battery level.
+- Examples: `examples/scan.rs` lists nearby devices,
+  `examples/battery.rs` connects to one and reads its battery level, and
+  `examples/probe.rs` connects to one and runs the discovery, RSSI,
+  notification and security checks from USAGE.md.
 - API reference: `cargo doc --open`.
 
 ## What's in the box
@@ -50,9 +52,11 @@ is tested against an in-memory transport.
 ## Platform support
 
 The socket layers are Linux-only (`#[cfg(target_os = "linux")]`) and need
-`CAP_NET_RAW` (or root) plus a controller that `bluetoothd` is not managing —
-a userland stack holding the adapter answers the scan commands with *Command
-Disallowed*.
+`CAP_NET_RAW` (or root). The scanner programs the controller directly,
+without telling the kernel or `bluetoothd`, and turns off any scan already
+running on it. Run it on an adapter nothing else scans on: stop
+`bluetoothd`, or give rustle an adapter of its own.
+[INSTALL.md](INSTALL.md) explains what goes wrong otherwise.
 
 On other platforms the crate still builds and the socket types still exist,
 but they cannot be constructed: `HciScanner::open`, `L2capAtt::connect` and

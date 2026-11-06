@@ -165,7 +165,7 @@ mod linux_impl {
         let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
         if fd < 0 {
             return Err(format!(
-                "cannot open HCI control socket (errno {}); need CAP_NET_RAW / root",
+                "cannot open HCI control socket (errno {}); is Bluetooth in the kernel?",
                 unsafe { errno() }
             ));
         }
@@ -209,7 +209,7 @@ mod linux_impl {
         let fd = unsafe { socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI) };
         if fd < 0 {
             return Err(format!(
-                "cannot open HCI control socket (errno {}); need CAP_NET_RAW / root",
+                "cannot open HCI control socket (errno {}); is Bluetooth in the kernel?",
                 unsafe { errno() }
             ));
         }
