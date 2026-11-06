@@ -158,10 +158,15 @@ and reads its battery level. [USAGE.md](USAGE.md) explains each step.
 
 ## Test in a container
 
-The repository's `Dockerfile` builds rustle and both examples on the latest
+The repository's `Dockerfile` builds rustle and its examples on the latest
 Ubuntu LTS, with the BlueZ tools installed. It is a quick way to try the
 examples against a real adapter without touching the toolchain on the
-machine. Build the image from the repository root:
+machine.
+
+Run the container with Docker Engine on the Linux machine the adapter is
+plugged into. Docker Desktop, on any operating system, runs containers in
+a virtual machine with no Bluetooth, so the examples and `btmgmt` cannot
+reach an adapter there. Build the image from the repository root:
 
 ```bash
 docker build -t rustle .
@@ -169,9 +174,11 @@ docker build -t rustle .
 
 The container needs three things to reach a controller. Bluetooth sockets
 belong to the network namespace, so it must share the machine's with
-`--net=host`. `NET_RAW` opens the raw sockets. `NET_ADMIN` lets `btmgmt`
-power the adapter on. The machine's `bluetoothd` still owns the controller
-from inside the container, so stop it first, as described above.
+`--net=host`. `NET_RAW` is the capability from "Grant socket permissions"
+above. Docker grants it to every container by default, and the flag keeps
+the command working under runtimes that do not. `NET_ADMIN` lets `btmgmt` power the adapter on. The
+machine's `bluetoothd` still runs beside the container, so stop it first,
+as described above.
 
 ```bash
 docker run --rm -it --net=host --cap-add=NET_RAW --cap-add=NET_ADMIN rustle
